@@ -3,7 +3,8 @@ import decimal
 import json
 from collections import defaultdict
 
-from django.core.exceptions import FieldDoesNotExist
+from django.core.exceptions import FieldDoesNotExist, ValidationError
+from django.core.validators import URLValidator
 from django.db import models, router
 from django.db.models.constants import LOOKUP_SEP
 from django.db.models.deletion import Collector
@@ -426,6 +427,16 @@ def display_for_field(value, field, empty_value_display):
         return formats.number_format(value)
     elif isinstance(field, models.FileField) and value:
         return format_html('<a href="{}">{}</a>', value.url, value)
+    elif isinstance(field, models.URLField) and value:
+        # Only render a clickable link for URLs with a safe scheme, so that a
+        # potentially dangerous stored value is shown as plain text rather than
+        # an executable link. The check is deliberately independent of the
+        # field's own validators, which may permit such schemes.
+        try:
+            URLValidator()(value)
+        except ValidationError:
+            return display_for_value(value, empty_value_display)
+        return format_html('<a href="{}">{}</a>', value, value)
     elif isinstance(field, models.JSONField) and value:
         try:
             return json.dumps(value, ensure_ascii=False, cls=field.encoder)
