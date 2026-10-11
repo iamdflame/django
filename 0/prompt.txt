@@ -1,0 +1,111 @@
+Backport a security fix to Django 4.2 (this checkout: tag 4.2.30 + fork base).
+
+Upstream fixed CVE-2026-48587 on the 5.2 branch with the commit below. Rebuild the same fix
+for 4.2 using this codebase's idioms (4.2 lacks some 5.x helpers; do not add them).
+
+Rules:
+- Keep the fix's observable behaviour identical to upstream: the same exception types
+  and the same user-visible messages (copy new or changed message strings verbatim).
+- Edit only files under django/. Do not create, edit or delete anything under tests/.
+- Do not commit or push.
+- The failing probe is tests/hl_cve_2026_48587. Check with:
+    python tests/runtests.py hl_cve_2026_48587 --parallel=1
+  and keep the touched module's tests passing, e.g.:
+    python tests/runtests.py model_formsets --parallel=1
+- Finish with a one-paragraph summary of the change.
+
+## Upstream commit message (intent)
+[5.2.x] Fixed CVE-2026-48587 -- Ignored whitespace padding when checking Vary header values.
+
+Thanks to Navid Rezazadeh for the report and Jacob Walls for review.
+
+Backport of 42aa0b3364d312e7c6472258d8b0e9c0277fbf22 from main.
+
+
+
+## Upstream fix diff (5.2)
+```diff
+diff --git a/django/utils/cache.py b/django/utils/cache.py
+index 3b014fbe51..253c687784 100644
+--- a/django/utils/cache.py
++++ b/django/utils/cache.py
+@@ -329,12 +329,12 @@ def has_vary_header(response, header_query):
+     Check to see if the response has a given header name in its Vary header.
+     """
+     if not response.has_header("Vary"):
+         return False
+     vary_headers = cc_delim_re.split(response.headers["Vary"])
+-    existing_headers = {header.lower() for header in vary_headers}
+-    return header_query.lower() in existing_headers
++    existing_headers = {header.lower().strip() for header in vary_headers}
++    return header_query.lower().strip() in existing_headers
+ 
+ 
+ def _i18n_cache_key_suffix(request, cache_key):
+     """If necessary, add the current locale or time zone to the cache key."""
+     if settings.USE_I18N:
+
+```
+
+## History of the touched code on 4.2 (git log -L)
+### has_vary_header (django/utils/cache.py:326-334)
+commit 9c19aff7c7 2022-02-03
+Refs #33476 -- Reformatted code with Black.
+
+diff --git a/django/utils/cache.py b/django/utils/cache.py
+--- a/django/utils/cache.py
++++ b/django/utils/cache.py
+@@ -305,9 +325,9 @@
+ def has_vary_header(response, header_query):
+     """
+     Check to see if the response has a given header name in its Vary header.
+     """
+-    if not response.has_header('Vary'):
++    if not response.has_header("Vary"):
+         return False
+-    vary_headers = cc_delim_re.split(response.headers['Vary'])
++    vary_headers = cc_delim_re.split(response.headers["Vary"])
+     existing_headers = {header.lower() for header in vary_headers}
+     return header_query.lower() in existing_headers
+commit bcc2befd0e 2020-07-14
+Fixed #31789 -- Added a new headers interface to HttpResponse.
+
+diff --git a/django/utils/cache.py b/django/utils/cache.py
+--- a/django/utils/cache.py
++++ b/django/utils/cache.py
+@@ -301,9 +301,9 @@
+ def has_vary_header(response, header_query):
+     """
+     Check to see if the response has a given header name in its Vary header.
+     """
+     if not response.has_header('Vary'):
+         return False
+-    vary_headers = cc_delim_re.split(response['Vary'])
++    vary_headers = cc_delim_re.split(response.headers['Vary'])
+     existing_headers = {header.lower() for header in vary_headers}
+     return header_query.lower() in existing_headers
+commit 2c69824e5a 2017-06-01
+Refs #23968 -- Removed unnecessary lists, generators, and tuple calls.
+
+diff --git a/django/utils/cache.py b/django/utils/cache.py
+--- a/django/utils/cache.py
++++ b/django/utils/cache.py
+@@ -296,9 +296,9 @@
+ def has_vary_header(response, header_query):
+     """
+     Check to see if the response has a given header name in its Vary header.
+     """
+     if not response.has_header('Vary'):
+         return False
+     vary_headers = cc_delim_re.split(response['Vary'])
+-    existing_headers = set(header.lower() for header in vary_headers)
++    existing_headers = {header.lower() for header in vary_headers}
+     return header_query.lower() in existing_headers
+
+
+## The probe fails on 4.2 like this
+Outcome on Django 4.2: FAIL (FAILED (failures=4))
+- hl_cve_2026_48587.tests.VaryHeaderWhitespaceTest.test_has_vary_header_asterisk_in_list_with_whitespace: AssertionError: False is not true
+- hl_cve_2026_48587.tests.VaryHeaderWhitespaceTest.test_has_vary_header_asterisk_with_leading_whitespace: AssertionError: False is not true
+- hl_cve_2026_48587.tests.VaryHeaderWhitespaceTest.test_has_vary_header_asterisk_with_trailing_whitespace: AssertionError: False is not true
+- hl_cve_2026_48587.tests.VaryHeaderWhitespaceTest.test_has_vary_header_normal_header_with_leading_whitespace: AssertionError: False is not true

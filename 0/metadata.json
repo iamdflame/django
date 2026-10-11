@@ -1,0 +1,53 @@
+{
+  "cli_version": "0.11.4",
+  "checkpoint_id": "01M4PD9Z4MJ21NDWGWXCGXMZGJ",
+  "session_id": "7fedcea5-7f7b-4cf4-ac08-a44cccee1619",
+  "strategy": "manual-commit",
+  "created_at": "2026-10-11T21:18:38.525052721Z",
+  "branch": "heirloom/cve-2026-48587-4.2",
+  "checkpoints_count": 1,
+  "save_step_count": 1,
+  "files_touched": [
+    "django/utils/cache.py"
+  ],
+  "agent": "Claude Code",
+  "model": "anthropic/claude-sonnet-4.6",
+  "turn_id": "e668513bda56",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 57,
+    "cache_creation_tokens": 7239,
+    "cache_read_tokens": 217955,
+    "output_tokens": 1402,
+    "api_call_count": 7
+  },
+  "session_metrics": {
+    "turn_count": 1
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-10-11T21:18:38.509566274Z",
+    "agent_lines": 2,
+    "agent_removed": 2,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 2,
+    "total_lines_changed": 4,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 140,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/settings.json": 101,
+        "tests/hl_cve_2026_48587/models.py": 1,
+        "tests/hl_cve_2026_48587/tests.py": 38
+      }
+    }
+  ]
+}
