@@ -1,0 +1,203 @@
+Backport a security fix to Django 4.2 (this checkout: tag 4.2.30 + fork base).
+
+Upstream fixed CVE-2026-48588 on the 5.2 branch with the commit below. Rebuild the same fix
+for 4.2 using this codebase's idioms (4.2 lacks some 5.x helpers; do not add them).
+
+Rules:
+- Keep the fix's observable behaviour identical to upstream: the same exception types
+  and the same user-visible messages (copy new or changed message strings verbatim).
+- Edit only files under django/. Do not create, edit or delete anything under tests/.
+- Do not commit or push.
+- The failing probe is tests/hl_cve_2026_48588. Check with:
+    python tests/runtests.py hl_cve_2026_48588 --parallel=1
+  and keep the touched module's tests passing, e.g.:
+    python tests/runtests.py model_formsets --parallel=1
+- Finish with a one-paragraph summary of the change.
+
+## Upstream commit message (intent)
+[5.2.x] Fixed CVE-2026-48588 -- Prevented caching of responses that set cookies and vary on Cookie.
+
+`UpdateCacheMiddleware` skipped caching `Set-Cookie` responses that vary
+on `Cookie` only when the request had no cookies at all. A request
+carrying an unrelated cookie bypassed the guard, allowing a newly-issued
+session cookie to be stored in Django's shared cache.
+
+The guard now applies whenever a response both sets a cookie and varies
+on Cookie, regardless of what cookies the incoming request carried.
+
+Thanks Chris Whyland for the report, Jake Howard for initial triage, and
+Jacob Walls for reviews.
+
+Backport of 6e365f8d01f2ba0bbd90968d76a42600fb8bc4b1 from main.
+
+
+
+## Upstream fix diff (5.2)
+```diff
+diff --git a/django/middleware/cache.py b/django/middleware/cache.py
+index c6c7416fde..fe60509cb8 100644
+--- a/django/middleware/cache.py
++++ b/django/middleware/cache.py
+@@ -93,16 +93,12 @@ class UpdateCacheMiddleware(MiddlewareMixin):
+ 
+         if response.streaming or response.status_code not in (200, 304):
+             return response
+ 
+         # Don't cache responses that set a user-specific (and maybe security
+-        # sensitive) cookie in response to a cookie-less request.
+-        if (
+-            not request.COOKIES
+-            and response.cookies
+-            and has_vary_header(response, "Cookie")
+-        ):
++        # sensitive) cookie while varying on Cookie.
++        if response.cookies and has_vary_header(response, "Cookie"):
+             return response
+ 
+         # Don't cache responses when the Cache-Control header is set to
+         # private, no-cache, or no-store.
+         cache_control = response.get("Cache-Control", "").lower()
+
+```
+
+## History of the touched code on 4.2 (git log -L)
+### UpdateCacheMiddleware.process_response (django/middleware/cache.py:82-127)
+commit 9c19aff7c7 2022-02-03
+Refs #33476 -- Reformatted code with Black.
+
+diff --git a/django/middleware/cache.py b/django/middleware/cache.py
+--- a/django/middleware/cache.py
++++ b/django/middleware/cache.py
+@@ -78,40 +82,46 @@
+     def process_response(self, request, response):
+         """Set the cache, if needed."""
+         if not self._should_update_cache(request, response):
+             # We don't need to update the cache, just return.
+             return response
+ 
+         if response.streaming or response.status_code not in (200, 304):
+             return response
+ 
+         # Don't cache responses that set a user-specific (and maybe security
+         # sensitive) cookie in response to a cookie-less request.
+-        if not request.COOKIES and response.cookies and has_vary_header(response, 'Cookie'):
++        if (
++            not request.COOKIES
++            and response.cookies
++            and has_vary_header(response, "Cookie")
++        ):
+             return response
+ 
+         # Don't cache a response with 'Cache-Control: private'
+-        if 'private' in response.get('Cache-Control', ()):
++        if "private" in response.get("Cache-Control", ()):
+             return response
+ 
+         # Page timeout takes precedence over the "max-age" and the default
+         # cache timeout.
+         timeout = self.page_timeout
+         if timeout is None:
+             # The timeout from the "max-age" section of the "Cache-Control"
+             # header takes precedence over the default cache timeout.
+             timeout = get_max_age(response)
+             if timeout is None:
+                 timeout = self.cache_timeout
+             elif timeout == 0:
+                 # max-age was set to 0, don't cache.
+                 return response
+         patch_response_headers(response, timeout)
+         if timeout and response.status_code == 200:
+-            cache_key = learn_cache_key(request, response, timeout, self.key_prefix, cache=self.cache)
+-            if hasattr(response, 'render') and callable(response.render):
++            cache_key = learn_cache_key(
++                request, response, timeout, self.key_prefix, cache=self.cache
++            )
++            if hasattr(response, "render") and callable(response.render):
+                 response.add_post_render_callback(
+                     lambda r: self.cache.set(cache_key, r, timeout)
+                 )
+             else:
+                 self.cache.set(cache_key, response, timeout)
+         return response
+commit d08d4f464a 2019-09-26
+Fixed #30765 -- Made cache_page decorator take precedence over max-age Cache-Control directive.
+
+diff --git a/django/middleware/cache.py b/django/middleware/cache.py
+--- a/django/middleware/cache.py
++++ b/django/middleware/cache.py
+@@ -74,37 +75,40 @@
+     def process_response(self, request, response):
+         """Set the cache, if needed."""
+         if not self._should_update_cache(request, response):
+             # We don't need to update the cache, just return.
+             return response
+ 
+         if response.streaming or response.status_code not in (200, 304):
+             return response
+ 
+         # Don't cache responses that set a user-specific (and maybe security
+         # sensitive) cookie in response to a cookie-less request.
+         if not request.COOKIES and response.cookies and has_vary_header(response, 'Cookie'):
+             return response
+ 
+         # Don't cache a response with 'Cache-Control: private'
+         if 'private' in response.get('Cache-Control', ()):
+             return response
+ 
+-        # Try to get the timeout from the "max-age" section of the "Cache-
+-        # Control" header before reverting to using the default cache_timeout
+-        # length.
+-        timeout = get_max_age(response)
++        # Page timeout takes precedence over the "max-age" and the default
++        # cache timeout.
++        timeout = self.page_timeout
+         if timeout is None:
+-            timeout = self.cache_timeout
+-        elif timeout == 0:
+-            # max-age was set to 0, don't bother caching.
+-            return response
++            # The timeout from the "max-age" section of the "Cache-Control"
++            # header takes precedence over the default cache timeout.
++            timeout = get_max_age(response)
++            if timeout is None:
++                timeout = self.cache_timeout
++            elif timeout == 0:
++                # max-age was set to 0, don't cache.
++                return response
+         patch_response_headers(response, timeout)
+         if timeout and response.status_code == 200:
+             cache_key = learn_cache_key(request, response, timeout, self.key_prefix, cache=self.cache)
+             if hasattr(response, 'render') and callable(response.render):
+                 response.add_post_render_callback(
+                     lambda r: self.cache.set(cache_key, r, timeout)
+                 )
+             else:
+                 self.cache.set(cache_key, response, timeout)
+         return response
+commit d968788b57 2018-02-06
+Fixed #28833 -- Prevented CacheMiddleware from caching responses with "Cache-Control: private".
+
+diff --git a/django/middleware/cache.py b/django/middleware/cache.py
+--- a/django/middleware/cache.py
++++ b/django/middleware/cache.py
+@@ -74,33 +74,37 @@
+     def process_response(self, request, response):
+         """Set the cache, if needed."""
+         if not self._should_update_cache(request, response):
+             # We don't need to update the cache, just return.
+             return response
+ 
+         if response.streaming or response.status_code not in (200, 304):
+             return response
+ 
+         # Don't cache responses that set a user-specific (and maybe security
+         # sensitive) cookie in response to a cookie-less request.
+         if not request.COOKIES and response.cookies and has_vary_header(response, 'Cookie'):
+             return response
+ 
++        # Don't cache a response with 'Cache-Control: privat
+
+## The probe fails on 4.2 like this
+Outcome on Django 4.2: FAIL (FAILED (failures=2))
+- hl_cve_2026_48588.tests.CacheSensitiveCookieTest.test_new_cookie_not_cached_with_unrelated_cookie: AssertionError: <HttpResponse status_code=200, "text/html; charset=utf-8"> is not None : Response setting a new cookie was cached despite unrelated request cookie
+- hl_cve_2026_48588.tests.CacheSensitiveCookieTest.test_refreshed_cookie_not_cached: AssertionError: <HttpResponse status_code=200, "text/html; charset=utf-8"> is not None : Response refreshing an existing cookie was cached
