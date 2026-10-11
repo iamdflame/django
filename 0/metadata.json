@@ -1,0 +1,53 @@
+{
+  "cli_version": "0.11.4",
+  "checkpoint_id": "01M4PDK6T8F1JJB6EGK16BJVBN",
+  "session_id": "5fcb123b-1529-4fca-81d6-8cfa98b866a4",
+  "strategy": "manual-commit",
+  "created_at": "2026-10-11T21:23:41.315976403Z",
+  "branch": "heirloom/cve-2026-53877-4.2",
+  "checkpoints_count": 1,
+  "save_step_count": 1,
+  "files_touched": [
+    "django/contrib/gis/gdal/raster/source.py"
+  ],
+  "agent": "Claude Code",
+  "model": "anthropic/claude-sonnet-4.6",
+  "turn_id": "745132f1ce2b",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 57,
+    "cache_creation_tokens": 8073,
+    "cache_read_tokens": 224421,
+    "output_tokens": 1278,
+    "api_call_count": 7
+  },
+  "session_metrics": {
+    "turn_count": 1
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-10-11T21:23:41.295476384Z",
+    "agent_lines": 1,
+    "agent_removed": 2,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 1,
+    "total_lines_changed": 3,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 167,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/settings.json": 101,
+        "tests/hl_cve_2026_53877/models.py": 3,
+        "tests/hl_cve_2026_53877/tests.py": 63
+      }
+    }
+  ]
+}
