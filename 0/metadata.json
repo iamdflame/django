@@ -24,6 +24,33 @@
   "session_metrics": {
     "turn_count": 1
   },
+  "summary": {
+    "intent": "Backport security fix for CVE-2026-87975 from Django 5.2 to Django 4.2, preventing forged POST data from deleting or creating objects outside a ModelFormSet's queryset via editable primary keys.",
+    "outcome": "Successfully applied a one-line fix to `django/forms/models.py` adding `or obj._state.adding` to the existing `obj.pk is None` guard in `save_existing_objects()`. All 3 CVE probe tests and all 74 `model_formsets` regression tests pass.",
+    "learnings": {
+      "repo": [
+        "Django 4.2 uses `obj.pk is None` directly rather than the `obj._is_pk_set()` helper introduced in 5.x — backports must preserve the older idiom.",
+        "Django sets `_state.adding = False` only after a successful database fetch; instances constructed in memory (via `construct_instance()` or `BaseInlineFormSet` parent-link assignment) retain `_state.adding = True` even if their PK field is later populated."
+      ],
+      "code": [
+        {
+          "path": "django/forms/models.py",
+          "line": 909,
+          "end_line": 933,
+          "finding": "`BaseModelFormSet.save_existing_objects()` iterated `initial_forms` and used `obj.pk is None` as the sole guard against acting on instances not fetched from the queryset. With editable PKs, `construct_instance()` or inline parent-link logic could populate the PK, bypassing this guard. The fix adds `or obj._state.adding` to catch all freshly constructed instances regardless of PK population."
+        }
+      ],
+      "workflow": [
+        "The upstream 5.2 diff was directly translatable to 4.2 by substituting the 5.x `_is_pk_set()` helper call with the 4.2 idiom (`obj.pk is None`) and appending the new `obj._state.adding` condition.",
+        "Running both the targeted CVE probe (`hl_cve_2026_87975`) and the touched module's full test suite (`model_formsets`) in parallel is an efficient way to confirm correctness without broader test runs."
+      ]
+    },
+    "friction": [],
+    "open_items": [
+      "No commit or push was made per the task rules — the fix remains as a local working-tree change only.",
+      "The fix covers `BaseModelFormSet`; it was not verified whether `BaseInlineFormSet` subclass overrides of `save_existing_objects` need a parallel guard in 4.2."
+    ]
+  },
   "initial_attribution": {
     "calculated_at": "2026-10-11T01:53:08.182700182Z",
     "agent_lines": 5,
