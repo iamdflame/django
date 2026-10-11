@@ -1,0 +1,192 @@
+Backport a security fix to Django 4.2 (this checkout: tag 4.2.30 + fork base).
+
+Upstream fixed CVE-2026-35192 on the 5.2 branch with the commit below. Rebuild the same fix
+for 4.2 using this codebase's idioms (4.2 lacks some 5.x helpers; do not add them).
+
+Rules:
+- Keep the fix's observable behaviour identical to upstream: the same exception types
+  and the same user-visible messages (copy new or changed message strings verbatim).
+- Edit only files under django/. Do not create, edit or delete anything under tests/.
+- Do not commit or push.
+- The failing probe is tests/hl_cve_2026_35192. Check with:
+    python tests/runtests.py hl_cve_2026_35192 --parallel=1
+  and keep the touched module's tests passing, e.g.:
+    python tests/runtests.py model_formsets --parallel=1
+- Finish with a one-paragraph summary of the change.
+
+## Upstream commit message (intent)
+[5.2.x] Fixed CVE-2026-35192 -- Ensured Vary header is sent when setting session cookie with SESSION_SAVE_EVERY_REQUEST=True.
+
+Thank you Jacob Walls and Natalia Bidart for reviews.
+
+Backport of 7f6e9b55130d5158804c0acbc0b24ccb7422ed82 from main.
+
+
+
+## Upstream fix diff (5.2)
+```diff
+diff --git a/django/contrib/sessions/middleware.py b/django/contrib/sessions/middleware.py
+index 9c934f9ddd..c6a5e33678 100644
+--- a/django/contrib/sessions/middleware.py
++++ b/django/contrib/sessions/middleware.py
+@@ -38,14 +38,15 @@ class SessionMiddleware(MiddlewareMixin):
+                 settings.SESSION_COOKIE_NAME,
+                 path=settings.SESSION_COOKIE_PATH,
+                 domain=settings.SESSION_COOKIE_DOMAIN,
+                 samesite=settings.SESSION_COOKIE_SAMESITE,
+             )
+-            patch_vary_headers(response, ("Cookie",))
++            need_vary_cookie = True
+         else:
+-            if accessed:
+-                patch_vary_headers(response, ("Cookie",))
++            # If the session was accessed, it must be varied on, regardless of
++            # whether it was modified or will be saved.
++            need_vary_cookie = accessed
+             if (modified or settings.SESSION_SAVE_EVERY_REQUEST) and not empty:
+                 if request.session.get_expire_at_browser_close():
+                     max_age = None
+                     expires = None
+                 else:
+@@ -72,6 +73,10 @@ class SessionMiddleware(MiddlewareMixin):
+                         path=settings.SESSION_COOKIE_PATH,
+                         secure=settings.SESSION_COOKIE_SECURE or None,
+                         httponly=settings.SESSION_COOKIE_HTTPONLY or None,
+                         samesite=settings.SESSION_COOKIE_SAMESITE,
+                     )
++                    # With a session cookie set, it must be varied on.
++                    need_vary_cookie = True
++        if need_vary_cookie:
++            patch_vary_headers(response, ("Cookie",))
+         return response
+
+```
+
+## History of the touched code on 4.2 (git log -L)
+### SessionMiddleware.process_response (django/contrib/sessions/middleware.py:22-77)
+commit 17472c3304 2022-11-24
+Fixed #34173 -- Skipped saving sessions on 5xx responses.
+
+diff --git a/django/contrib/sessions/middleware.py b/django/contrib/sessions/middleware.py
+--- a/django/contrib/sessions/middleware.py
++++ b/django/contrib/sessions/middleware.py
+@@ -22,56 +22,56 @@
+     def process_response(self, request, response):
+         """
+         If request.session was modified, or if the configuration is to save the
+         session every time, save the changes and set a session cookie or delete
+         the session cookie if the session has been emptied.
+         """
+         try:
+             accessed = request.session.accessed
+             modified = request.session.modified
+             empty = request.session.is_empty()
+         except AttributeError:
+             return response
+         # First check if we need to delete this cookie.
+         # The session should be deleted only if the session is entirely empty.
+         if settings.SESSION_COOKIE_NAME in request.COOKIES and empty:
+             response.delete_cookie(
+                 settings.SESSION_COOKIE_NAME,
+                 path=settings.SESSION_COOKIE_PATH,
+                 domain=settings.SESSION_COOKIE_DOMAIN,
+                 samesite=settings.SESSION_COOKIE_SAMESITE,
+             )
+             patch_vary_headers(response, ("Cookie",))
+         else:
+             if accessed:
+                 patch_vary_headers(response, ("Cookie",))
+             if (modified or settings.SESSION_SAVE_EVERY_REQUEST) and not empty:
+                 if request.session.get_expire_at_browser_close():
+                     max_age = None
+                     expires = None
+                 else:
+                     max_age = request.session.get_expiry_age()
+                     expires_time = time.time() + max_age
+                     expires = http_date(expires_time)
+                 # Save the session data and refresh the client cookie.
+-                # Skip session save for 500 responses, refs #3881.
+-                if response.status_code != 500:
++                # Skip session save for 5xx responses.
++                if response.status_code < 500:
+                     try:
+                         request.session.save()
+                     except UpdateError:
+                         raise SessionInterrupted(
+                             "The request's session was deleted before the "
+                             "request completed. The user may have logged "
+                             "out in a concurrent request, for example."
+                         )
+                     response.set_cookie(
+                         settings.SESSION_COOKIE_NAME,
+                         request.session.session_key,
+                         max_age=max_age,
+                         expires=expires,
+                         domain=settings.SESSION_COOKIE_DOMAIN,
+                         path=settings.SESSION_COOKIE_PATH,
+                         secure=settings.SESSION_COOKIE_SECURE or None,
+                         httponly=settings.SESSION_COOKIE_HTTPONLY or None,
+                         samesite=settings.SESSION_COOKIE_SAMESITE,
+                     )
+         return response
+commit 9c19aff7c7 2022-02-03
+Refs #33476 -- Reformatted code with Black.
+
+diff --git a/django/contrib/sessions/middleware.py b/django/contrib/sessions/middleware.py
+--- a/django/contrib/sessions/middleware.py
++++ b/django/contrib/sessions/middleware.py
+@@ -22,54 +22,56 @@
+     def process_response(self, request, response):
+         """
+         If request.session was modified, or if the configuration is to save the
+         session every time, save the changes and set a session cookie or delete
+         the session cookie if the session has been emptied.
+         """
+         try:
+             accessed = request.session.accessed
+             modified = request.session.modified
+             empty = request.session.is_empty()
+         except AttributeError:
+             return response
+         # First check if we need to delete this cookie.
+         # The session should be deleted only if the session is entirely empty.
+         if settings.SESSION_COOKIE_NAME in request.COOKIES and empty:
+             response.delete_cookie(
+                 settings.SESSION_COOKIE_NAME,
+                 path=settings.SESSION_COOKIE_PATH,
+                 domain=settings.SESSION_COOKIE_DOMAIN,
+                 samesite=settings.SESSION_COOKIE_SAMESITE,
+             )
+-            patch_vary_headers(response, ('Cookie',))
++            patch_vary_headers(response, ("Cookie",))
+         else:
+             if accessed:
+-                patch_vary_headers(response, ('Cookie',))
++                patch_vary_headers(response, ("Cookie",))
+             if (modified or settings.SESSION_SAVE_EVERY_REQUEST) and not empty:
+                 if request.session.get_expire_at_browser_close():
+                     max_age = None
+                     expires = None
+                 else:
+                     max_age = request.session.get_expiry_age()
+                     expires_time = time.time() + max_age
+                     expires = http_date(expires_time)
+                 # Save the session data and refresh the client cookie.
+                 # Skip session save for 500 responses, refs #3881.
+                 if response.status_code != 500:
+                     try:
+                         request.session.save()
+                     except UpdateError:
+                         raise SessionInterrupted(
+                             "The request's session was deleted before the "
+                             "request completed. The user may have logged "
+                             "out in a concurrent request, for example."
+                         )
+                     response.set_cookie(
+                         settings.SESSION_COOKIE_NAME,
+-                        request.session.session_key, max_age=max_age,
+-                        expires=expires, domain=settings.SESSION_COOKI
+
+## The probe fails on 4.2 like this
+Outcome on Django 4.2: FAIL (FAILED (failures=1))
+- hl_cve_2026_35192.tests.SessionFixationVaryHeaderTests.test_vary_cookie_set_when_save_every_request_and_session_not_accessed: AssertionError: 'Cookie' not found in '' : Response must include 'Vary: Cookie' when SESSION_SAVE_EVERY_REQUEST=True and a session cookie is being set, to prevent session fixation via caches. Got Vary: ''
