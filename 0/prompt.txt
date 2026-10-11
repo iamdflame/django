@@ -1,0 +1,256 @@
+Backport a security fix to Django 4.2 (this checkout: tag 4.2.30 + fork base).
+
+Upstream fixed CVE-2026-6873 on the 5.2 branch with the commit below. Rebuild the same fix
+for 4.2 using this codebase's idioms (4.2 lacks some 5.x helpers; do not add them).
+
+Rules:
+- Keep the fix's observable behaviour identical to upstream: the same exception types
+  and the same user-visible messages (copy new or changed message strings verbatim).
+- Edit only files under django/. Do not create, edit or delete anything under tests/.
+- Do not commit or push.
+- The failing probe is tests/hl_cve_2026_6873. Check with:
+    python tests/runtests.py hl_cve_2026_6873 --parallel=1
+  and keep the touched module's tests passing, e.g.:
+    python tests/runtests.py model_formsets --parallel=1
+- Finish with a one-paragraph summary of the change.
+
+## Upstream commit message (intent)
+[5.2.x] Fixed CVE-2026-6873 -- Prevented signed cookie salt namespace collisions.
+
+Made signed cookies derive their signer namespace from an injective
+encoding of `(name, salt)` while preserving compatibility with legacy
+`name + salt` cookies behind SIGNED_COOKIE_LEGACY_SALT_FALLBACK.
+
+Thanks Peng Zhou for the report, and Shai Berger, Markus Holterman,
+Jake Howard, and Paul McMillan for reviews.
+
+Co-authored-by: Jacob Walls <jacobtylerwalls@gmail.com>
+Co-authored-by: Natalia <124304+nessita@users.noreply.github.com>
+
+Backport of 70d36515b9cc71700105a14b275583070d48b689 from main.
+
+
+
+## Upstream fix diff (5.2)
+```diff
+diff --git a/django/conf/global_settings.py b/django/conf/global_settings.py
+index f4535acb09..00c5778bc8 100644
+--- a/django/conf/global_settings.py
++++ b/django/conf/global_settings.py
+@@ -553,10 +553,11 @@ AUTH_PASSWORD_VALIDATORS = []
+ 
+ ###########
+ # SIGNING #
+ ###########
+ 
++SIGNED_COOKIE_LEGACY_SALT_FALLBACK = True
+ SIGNING_BACKEND = "django.core.signing.TimestampSigner"
+ 
+ ########
+ # CSRF #
+ ########
+diff --git a/django/core/signing.py b/django/core/signing.py
+index e3d7785910..faea20eadf 100644
+--- a/django/core/signing.py
++++ b/django/core/signing.py
+@@ -104,10 +104,34 @@ def base64_hmac(salt, value, key, algorithm="sha1"):
+ def _cookie_signer_key(key):
+     # SECRET_KEYS items may be str or bytes.
+     return b"django.http.cookies" + force_bytes(key)
+ 
+ 
++def _cookie_signer_salt(cookie_name, salt=""):
++    # Prefix the salt length so (cookie_name, salt) pairs can't collide.
++    return f"django.http.cookies.v2:{len(salt)}:{salt}{cookie_name}"
++
++
++def _cookie_signer_legacy_salt(cookie_name, salt=""):
++    return cookie_name + salt
++
++
++def _unsign_cookie(signed_value, *, cookie_name, salt="", max_age=None):
++    try:
++        return get_cookie_signer(salt=_cookie_signer_salt(cookie_name, salt)).unsign(
++            signed_value, max_age=max_age
++        )
++    except BadSignature as exc:
++        if settings.SIGNED_COOKIE_LEGACY_SALT_FALLBACK and not isinstance(
++            exc, SignatureExpired
++        ):
++            return get_cookie_signer(
++                salt=_cookie_signer_legacy_salt(cookie_name, salt)
++            ).unsign(signed_value, max_age=max_age)
++        raise
++
++
+ def get_cookie_signer(salt="django.core.signing.get_cookie_signer"):
+     Signer = import_string(settings.SIGNING_BACKEND)
+     return Signer(
+         key=_cookie_signer_key(settings.SECRET_KEY),
+         fallback_keys=map(_cookie_signer_key, settings.SECRET_KEY_FALLBACKS),
+diff --git a/django/http/request.py b/django/http/request.py
+index 7771f507d3..f96051e809 100644
+--- a/django/http/request.py
++++ b/django/http/request.py
+@@ -241,12 +241,12 @@ class HttpRequest:
+             if default is not RAISE_ERROR:
+                 return default
+             else:
+                 raise
+         try:
+-            value = signing.get_cookie_signer(salt=key + salt).unsign(
+-                cookie_value, max_age=max_age
++            value = signing._unsign_cookie(
++                cookie_value, cookie_name=key, salt=salt, max_age=max_age
+             )
+         except signing.BadSignature:
+             if default is not RAISE_ERROR:
+                 return default
+             else:
+diff --git a/django/http/response.py b/django/http/response.py
+index 8b23a92517..36fd0d4ceb 100644
+--- a/django/http/response.py
++++ b/django/http/response.py
+@@ -282,11 +282,13 @@ class HttpResponseBase:
+     def setdefault(self, key, value):
+         """Set a header unless it has already been set."""
+         self.headers.setdefault(key, value)
+ 
+     def set_signed_cookie(self, key, value, salt="", **kwargs):
+-        value = signing.get_cookie_signer(salt=key + salt).sign(value)
++        value = signing.get_cookie_signer(
++            salt=signing._cookie_signer_salt(key, salt)
++        ).sign(value)
+         return self.set_cookie(key, value, **kwargs)
+ 
+     def delete_cookie(self, key, path="/", domain=None, samesite=None):
+         # Browsers can ignore the Set-Cookie header if the cookie doesn't use
+         # the secure flag and:
+
+```
+
+## History of the touched code on 4.2 (git log -L)
+### HttpRequest.get_signed_cookie (django/http/request.py:178-200)
+commit 9c19aff7c7 2022-02-03
+Refs #33476 -- Reformatted code with Black.
+
+diff --git a/django/http/request.py b/django/http/request.py
+--- a/django/http/request.py
++++ b/django/http/request.py
+@@ -160,22 +176,23 @@
+-    def get_signed_cookie(self, key, default=RAISE_ERROR, salt='', max_age=None):
++    def get_signed_cookie(self, key, default=RAISE_ERROR, salt="", max_age=None):
+         """
+         Attempt to return a signed cookie. If the signature fails or the
+         cookie has expired, raise an exception, unless the `default` argument
+         is provided,  in which case return that value.
+         """
+         try:
+             cookie_value = self.COOKIES[key]
+         except KeyError:
+             if default is not RAISE_ERROR:
+                 return default
+             else:
+                 raise
+         try:
+             value = signing.get_cookie_signer(salt=key + salt).unsign(
+-                cookie_value, max_age=max_age)
++                cookie_value, max_age=max_age
++            )
+         except signing.BadSignature:
+             if default is not RAISE_ERROR:
+                 return default
+             else:
+                 raise
+         return value
+commit 3eb679a869 2017-01-24
+Refs #27656 -- Updated django.forms/http docstring verbs according to PEP 257.
+
+diff --git a/django/http/request.py b/django/http/request.py
+--- a/django/http/request.py
++++ b/django/http/request.py
+@@ -122,22 +122,22 @@
+     def get_signed_cookie(self, key, default=RAISE_ERROR, salt='', max_age=None):
+         """
+-        Attempts to return a signed cookie. If the signature fails or the
+-        cookie has expired, raises an exception... unless you provide the
+-        default argument in which case that value will be returned instead.
++        Attempt to return a signed cookie. If the signature fails or the
++        cookie has expired, raise an exception, unless the `default` argument
++        is provided,  in which case return that value.
+         """
+         try:
+             cookie_value = self.COOKIES[key]
+         except KeyError:
+             if default is not RAISE_ERROR:
+                 return default
+             else:
+                 raise
+         try:
+             value = signing.get_cookie_signer(salt=key + salt).unsign(
+                 cookie_value, max_age=max_age)
+         except signing.BadSignature:
+             if default is not RAISE_ERROR:
+                 return default
+             else:
+                 raise
+         return value
+commit b4066d7d21 2012-10-21
+Cleaned up the the http module. Moved all of the code from __init__.py to request.py, response.py and utils.py
+
+diff --git a/django/http/request.py b/django/http/request.py
+--- /dev/null
++++ b/django/http/request.py
+@@ -0,0 +77,22 @@
++    def get_signed_cookie(self, key, default=RAISE_ERROR, salt='', max_age=None):
++        """
++        Attempts to return a signed cookie. If the signature fails or the
++        cookie has expired, raises an exception... unless you provide the
++        default argument in which case that value will be returned instead.
++        """
++        try:
++            cookie_value = self.COOKIES[key]
++        except KeyError:
++            if default is not RAISE_ERROR:
++                return default
++            else:
++                raise
++        try:
++            value = signing.get_cookie_signer(salt=key + salt).unsign(
++                cookie_value, max_age=max_age)
++        except signing.BadSignature:
++            if default is not RAISE_ERROR:
++                return default
++            else:
++                raise
++        return value
+
+
+### HttpResponseBase.set_signed_cookie (django/http/response.py:285-287)
+commit 9c19aff7c7 2022-02-03
+Refs #33476 -- Reformatted code with Black.
+
+diff --git a/django/http/response.py b/django/http/response.py
+--- a/django/http/response.py
++++ b/django/http/response.py
+@@ -234,3 +255,3 @@
+-    def set_signed_cookie(self, key, value, salt='', **kwargs):
++    def set_signed_cookie(self, key, value, salt="", **kwargs):
+         value = signing.get_cookie_signer(salt=key + salt).sign(value)
+         return self.set_cookie(key, value, **kwargs)
+commit b4066d7d21 2012-10-21
+Cleaned up the the http module. Moved all of the code from __init__.py to request.py, response.py and utils.py
+
+diff --git a/django/http/response.py b/django/http/response.py
+--- /dev/null
++++ b/django/http/response.py
+@@ -0,0 +182,3 @@
++    def set_signed_cookie(self, key, value, salt='', **kwargs):
++        value = signing.get_cookie_signer(salt=key + salt).sign(value)
++        return self.set_cookie(key, value, **kwargs)
+
+
+## The probe fails on 4.2 like this
+Outcome on Django 4.2: FAIL (FAILED (failures=2))
+- hl_cve_2026_6873.tests.SignedCookieSaltNamespaceCollisionTest.test_different_key_same_concatenation_rejected: AssertionError: BadSignature not raised
+- hl_cve_2026_6873.tests.SignedCookieSaltNamespaceCollisionTest.test_salt_namespace_collision_rejected: AssertionError: BadSignature not raised

@@ -1,0 +1,56 @@
+{
+  "cli_version": "0.11.4",
+  "checkpoint_id": "01M4PDE02HV5QR9RTZ7M9DSRAC",
+  "session_id": "2738453b-d820-4262-97ef-e67bfea3b417",
+  "strategy": "manual-commit",
+  "created_at": "2026-10-11T21:20:50.613581877Z",
+  "branch": "heirloom/cve-2026-6873-4.2",
+  "checkpoints_count": 1,
+  "save_step_count": 1,
+  "files_touched": [
+    "django/conf/global_settings.py",
+    "django/core/signing.py",
+    "django/http/request.py",
+    "django/http/response.py"
+  ],
+  "agent": "Claude Code",
+  "model": "anthropic/claude-sonnet-4.6",
+  "turn_id": "e645c1067fcc",
+  "compact_transcript_start": 0,
+  "token_usage": {
+    "input_tokens": 57,
+    "cache_creation_tokens": 12134,
+    "cache_read_tokens": 242127,
+    "output_tokens": 3030,
+    "api_call_count": 7
+  },
+  "session_metrics": {
+    "turn_count": 1
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-10-11T21:20:50.58677164Z",
+    "agent_lines": 30,
+    "agent_removed": 3,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 30,
+    "total_lines_changed": 33,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 165,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".claude/settings.json": 101,
+        "tests/hl_cve_2026_6873/models.py": 1,
+        "tests/hl_cve_2026_6873/tests.py": 63
+      }
+    }
+  ]
+}
