@@ -1,0 +1,149 @@
+Backport a security fix to Django 4.2 (this checkout: tag 4.2.30 + fork base).
+
+Upstream fixed CVE-2026-5766 on the 5.2 branch with the commit below. Rebuild the same fix
+for 4.2 using this codebase's idioms (4.2 lacks some 5.x helpers; do not add them).
+
+Rules:
+- Keep the fix's observable behaviour identical to upstream: the same exception types
+  and the same user-visible messages (copy new or changed message strings verbatim).
+- Edit only files under django/. Do not create, edit or delete anything under tests/.
+- Do not commit or push.
+- The failing probe is tests/hl_cve_2026_5766. Check with:
+    python tests/runtests.py hl_cve_2026_5766 --parallel=1
+  and keep the touched module's tests passing, e.g.:
+    python tests/runtests.py model_formsets --parallel=1
+- Finish with a one-paragraph summary of the change.
+
+## Upstream commit message (intent)
+[5.2.x] Fixed CVE-2026-5766 -- Enforced DATA_UPLOAD_MAX_MEMORY_SIZE in MemoryFileUploadHandler on ASGI.
+
+In ASGI deployments, Content-Length is not guaranteed to reflect the
+actual request body size, so relying on it to gate memory allocation
+allowed the limit to be bypassed. The handler now enforces
+DATA_UPLOAD_MAX_MEMORY_SIZE regardless of the declared header value.
+
+Thanks to Kyle Agronick for the report. Refs #35289.
+
+Co-authored-by: Natalia <124304+nessita@users.noreply.github.com>
+
+Backport of 5a89e341bfc77dd67b7fd57b7091b6430558e1f4 from main.
+
+
+
+## Upstream fix diff (5.2)
+```diff
+diff --git a/django/core/files/uploadhandler.py b/django/core/files/uploadhandler.py
+index ab86f7fede..9248323233 100644
+--- a/django/core/files/uploadhandler.py
++++ b/django/core/files/uploadhandler.py
+@@ -1,11 +1,11 @@
+ """
+ Base file upload handler classes, and the built-in concrete subclasses
+ """
+ 
+ import os
+-from io import BytesIO
++from io import BytesIO, UnsupportedOperation
+ 
+ from django.conf import settings
+ from django.core.files.uploadedfile import InMemoryUploadedFile, TemporaryUploadedFile
+ from django.utils.module_loading import import_string
+ 
+@@ -200,13 +200,28 @@ class MemoryFileUploadHandler(FileUploadHandler):
+     ):
+         """
+         Use the content_length to signal whether or not this handler should be
+         used.
+         """
+-        # Check the content-length header to see if we should
+         # If the post is too large, we cannot use the Memory handler.
+-        self.activated = content_length <= settings.FILE_UPLOAD_MAX_MEMORY_SIZE
++        # Content-Length can be absent or understated (for example
++        # `Transfer-Encoding: chunked` on ASGI), so for seekable streams (such
++        # as SpooledTemporaryFile on ASGI), check the actual size.
++
++        stream = getattr(input_data, "_stream", input_data)
++        try:
++            content_length = stream.seek(0, os.SEEK_END)
++        except (UnsupportedOperation, AttributeError):
++            # Cannot seek; fall back to the Content-Length parameter.
++            # On WSGI the stream enforces this value so it is trustworthy.
++            pass
++        else:
++            stream.seek(0)
++        self.activated = (
++            content_length is not None
++            and content_length <= settings.FILE_UPLOAD_MAX_MEMORY_SIZE
++        )
+ 
+     def new_file(self, *args, **kwargs):
+         super().new_file(*args, **kwargs)
+         if self.activated:
+             self.file = BytesIO()
+
+```
+
+## History of the touched code on 4.2 (git log -L)
+### MemoryFileUploadHandler.handle_raw_input (django/core/files/uploadhandler.py:197-206)
+commit 9c19aff7c7 2022-02-03
+Refs #33476 -- Reformatted code with Black.
+
+diff --git a/django/core/files/uploadhandler.py b/django/core/files/uploadhandler.py
+--- a/django/core/files/uploadhandler.py
++++ b/django/core/files/uploadhandler.py
+@@ -172,8 +197,10 @@
+-    def handle_raw_input(self, input_data, META, content_length, boundary, encoding=None):
++    def handle_raw_input(
++        self, input_data, META, content_length, boundary, encoding=None
++    ):
+         """
+         Use the content_length to signal whether or not this handler should be
+         used.
+         """
+         # Check the content-length header to see if we should
+         # If the post is too large, we cannot use the Memory handler.
+         self.activated = content_length <= settings.FILE_UPLOAD_MAX_MEMORY_SIZE
+commit a38ae914d8 2018-01-12
+Fixed #28996 -- Simplified some boolean constructs and removed trivial continue statements.
+
+diff --git a/django/core/files/uploadhandler.py b/django/core/files/uploadhandler.py
+--- a/django/core/files/uploadhandler.py
++++ b/django/core/files/uploadhandler.py
+@@ -156,11 +156,8 @@
+     def handle_raw_input(self, input_data, META, content_length, boundary, encoding=None):
+         """
+         Use the content_length to signal whether or not this handler should be
+         used.
+         """
+         # Check the content-length header to see if we should
+         # If the post is too large, we cannot use the Memory handler.
+-        if content_length > settings.FILE_UPLOAD_MAX_MEMORY_SIZE:
+-            self.activated = False
+-        else:
+-            self.activated = True
++        self.activated = content_length <= settings.FILE_UPLOAD_MAX_MEMORY_SIZE
+commit 5a6f70b428 2017-01-25
+Refs #27656 -- Updated django.core docstring verbs according to PEP 257.
+
+diff --git a/django/core/files/uploadhandler.py b/django/core/files/uploadhandler.py
+--- a/django/core/files/uploadhandler.py
++++ b/django/core/files/uploadhandler.py
+@@ -159,10 +159,11 @@
+     def handle_raw_input(self, input_data, META, content_length, boundary, encoding=None):
+         """
+-        Use the content_length to signal whether or not this handler should be in use.
++        Use the content_length to signal whether or not this handler should be
++        used.
+         """
+         # Check the content-length header to see if we should
+         # If the post is too large, we cannot use the Memory handler.
+         if content_length > settings.FILE_UPLOAD_MAX_MEMORY_SIZE:
+             self.activated = False
+         else:
+             self.activated = True
+
+
+## The probe fails on 4.2 like this
+Outcome on Django 4.2: FAIL (FAILED (failures=2))
+- hl_cve_2026_5766.tests.REDACTED.test_seekable_stream_exceeds_limit_deactivated: AssertionError: True is not False : Handler must be deactivated when actual stream size (15) exceeds FILE_UPLOAD_MAX_MEMORY_SIZE (10), regardless of understated content_length (0).
+- hl_cve_2026_5766.tests.REDACTED.test_seekable_stream_understated_content_length_large_data: AssertionError: True is not False : Handler must be deactivated when actual stream size (100) exceeds FILE_UPLOAD_MAX_MEMORY_SIZE (50), even though content_length=1.
