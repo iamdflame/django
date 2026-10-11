@@ -1,0 +1,191 @@
+Backport a security fix to Django 4.2 (this checkout: tag 4.2.30 + fork base).
+
+Upstream fixed CVE-2026-87975 on the 5.2 branch with the commit below. Rebuild the same fix
+for 4.2 using this codebase's idioms (4.2 lacks some 5.x helpers; do not add them).
+
+Rules:
+- Edit only files under django/. Do not create, edit or delete anything under tests/.
+- Do not commit or push.
+- The failing probe is tests/hl_cve_2026_87975. Check with:
+    python tests/runtests.py hl_cve_2026_87975 --parallel=1
+  and keep the touched module's tests passing, e.g.:
+    python tests/runtests.py model_formsets --parallel=1
+- Finish with a one-paragraph summary of the change.
+
+## Upstream commit message (intent)
+[5.2.x] Fixed CVE-2026-87975 -- Prevented forging actions in model formsets with editable PKs.
+
+Deleting instances outside a `ModelFormSet`'s queryset was possible by
+forging POST data for an editable primary key. In the same way, creating
+instances was possible for edit-only model formsets.
+
+An object outside the queryset is represented by a newly constructed
+instance, but its PK can still be populated: `BaseInlineFormSet` sets
+the parent link when it's also the primary key, and
+`construct_instance()` sets any editable primary PK present on the form.
+`save_existing_objects()` then took the populated primary key as proof
+that the instance came from the queryset and deleted or persisted the
+row.
+
+This change now checks `_state.adding` to identify instances that did
+not come from the queryset, whichever way the primary key was populated.
+Models using the default `AutoField` primary key are not affected.
+
+Thanks Seonggwon Yoon for the report and Natalia Bidart for reviews.
+
+Backport of 83cbd21be57483e6b3eb6e4688a561c841aff75e from main.
+
+
+
+## Upstream fix diff (5.2)
+```diff
+diff --git a/django/forms/models.py b/django/forms/models.py
+index be59dbe4a0..ac144d1ddf 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -929,15 +929,16 @@ class BaseModelFormSet(BaseFormSet, AltersData):
+ 
+         saved_instances = []
+         forms_to_delete = self.deleted_forms
+         for form in self.initial_forms:
+             obj = form.instance
+-            # If the pk is None, it means either:
+-            # 1. The object is an unexpected empty model, created by invalid
+-            #    POST data such as an object outside the formset's queryset.
++            # If the pk is unset or the instance is being added, it could mean:
++            # 1. The object is an unexpected unfetched instance, created by
++            #    invalid POST data such as an object outside the formset's
++            #    queryset, or a formset with edit_only=True.
+             # 2. The object was already deleted from the database.
+-            if not obj._is_pk_set():
++            if not obj._is_pk_set() or obj._state.adding:
+                 continue
+             if form in forms_to_delete:
+                 self.deleted_objects.append(obj)
+                 self.delete_existing(obj, commit=commit)
+             elif form.has_changed():
+
+```
+
+## History of the touched code on 4.2 (git log -L)
+### BaseModelFormSet.save_existing_objects (django/forms/models.py:909-933)
+commit 181f492ad0 2016-12-07
+Fixed #27416 -- Prevented ModelFormSet from creating objects for invalid PKs in data.
+
+diff --git a/django/forms/models.py b/django/forms/models.py
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -748,24 +748,25 @@
+     def save_existing_objects(self, commit=True):
+         self.changed_objects = []
+         self.deleted_objects = []
+         if not self.initial_forms:
+             return []
+ 
+         saved_instances = []
+         forms_to_delete = self.deleted_forms
+         for form in self.initial_forms:
+             obj = form.instance
++            # If the pk is None, it means either:
++            # 1. The object is an unexpected empty model, created by invalid
++            #    POST data such as an object outside the formset's queryset.
++            # 2. The object was already deleted from the database.
++            if obj.pk is None:
++                continue
+             if form in forms_to_delete:
+-                # If the pk is None, it means that the object can't be
+-                # deleted again. Possible reason for this is that the
+-                # object was already deleted from the DB. Refs #14877.
+-                if obj.pk is None:
+-                    continue
+                 self.deleted_objects.append(obj)
+                 self.delete_existing(obj, commit=commit)
+             elif form.has_changed():
+                 self.changed_objects.append((obj, form.changed_data))
+                 saved_instances.append(self.save_existing(form, obj, commit=commit))
+                 if not commit:
+                     self.saved_forms.append(form)
+         return saved_instances
+commit 0ffa3943fb 2015-07-10
+Fixed #25097 -- Added BaseModelFormSet.delete_existing() hook.
+
+diff --git a/django/forms/models.py b/django/forms/models.py
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -742,25 +747,24 @@
+     def save_existing_objects(self, commit=True):
+         self.changed_objects = []
+         self.deleted_objects = []
+         if not self.initial_forms:
+             return []
+ 
+         saved_instances = []
+         forms_to_delete = self.deleted_forms
+         for form in self.initial_forms:
+             obj = form.instance
+             if form in forms_to_delete:
+                 # If the pk is None, it means that the object can't be
+                 # deleted again. Possible reason for this is that the
+                 # object was already deleted from the DB. Refs #14877.
+                 if obj.pk is None:
+                     continue
+                 self.deleted_objects.append(obj)
+-                if commit:
+-                    obj.delete()
++                self.delete_existing(obj, commit=commit)
+             elif form.has_changed():
+                 self.changed_objects.append((obj, form.changed_data))
+                 saved_instances.append(self.save_existing(form, obj, commit=commit))
+                 if not commit:
+                     self.saved_forms.append(form)
+         return saved_instances
+commit efb0100ee6 2013-10-30
+Fixed #14877 -- repeated deletion using formsets
+
+diff --git a/django/forms/models.py b/django/forms/models.py
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -705,29 +709,25 @@
+     def save_existing_objects(self, commit=True):
+         self.changed_objects = []
+         self.deleted_objects = []
+         if not self.initial_forms:
+             return []
+ 
+         saved_instances = []
+         forms_to_delete = self.deleted_forms
+         for form in self.initial_forms:
+-            pk_name = self._pk_field.name
+-            raw_pk_value = form._raw_value(pk_name)
+-
+-            # clean() for different types of PK fields can sometimes return
+-            # the model instance, and sometimes the PK. Handle either.
+-            pk_value = form.fields[pk_name].clean(raw_pk_value)
+-            pk_value = getattr(pk_value, 'pk', pk_value)
+-
+-            obj = self._existing_object(pk_value)
++            obj = form.instance
+             if form in forms_to_delete:
++                # If the pk is None, it means that the object can't be
++                # deleted again. Possible reason for this is that the
++                # object was already deleted from the DB. Refs #14877.
++                if obj.pk is None:
++                    continue
+                 self.deleted_objects.append(obj)
+                 if commit:
+                     obj.delete()
+-                continue
+-            if form.has_changed():
++            elif form.has_changed():
+                 self.changed_objects.append((obj, form.changed_data))
+                 saved_instances.append(self.save_existing(form, obj, commit=commit))
+                 if not commit:
+                     self.saved_forms.append(form)
+         return saved_instances
+
+
+## The probe fails on 4.2 like this
+Outcome on Django 4.2: FAIL (FAILED (failures=3))
+- hl_cve_2026_87975.tests.EditablePKFormsetSecurityTests.test_deletion_not_allowed_outside_formset_queryset_editable_pk: AssertionError: False is not true : CVE-2026-87975: object outside the formset queryset was deleted via forged POST data.
+- hl_cve_2026_87975.tests.EditablePKFormsetSecurityTests.test_edit_only_extra_form_does_not_create_via_forged_pk: AssertionError: True is not false : CVE-2026-87975: edit-only formset created 'ghost' object via forged PK.
+- hl_cve_2026_87975.tests.EditablePKFormsetSecurityTests.test_edit_only_formset_cannot_create_via_forged_pk: AssertionError: True is not false : CVE-2026-87975: edit-only formset created a new object via forged PK.
