@@ -1,0 +1,203 @@
+Backport a security fix to Django 4.2 (this checkout: tag 4.2.30 + fork base).
+
+Upstream fixed CVE-2026-15920 on the 5.2 branch with the commit below. Rebuild the same fix
+for 4.2 using this codebase's idioms (4.2 lacks some 5.x helpers; do not add them).
+
+Rules:
+- Keep the fix's observable behaviour identical to upstream: the same exception types
+  and the same user-visible messages (copy new or changed message strings verbatim).
+- Edit only files under django/. Do not create, edit or delete anything under tests/.
+- Do not commit or push.
+- The failing probe is tests/hl_cve_2026_15920. Check with:
+    python tests/runtests.py hl_cve_2026_15920 --parallel=1
+  and keep the touched module's tests passing, e.g.:
+    python tests/runtests.py model_formsets --parallel=1
+- Finish with a one-paragraph summary of the change.
+
+## Upstream commit message (intent)
+[5.2.x] Fixed CVE-2026-15920 -- Made display_for_field() validate URLs before rendering admin links.
+
+The admin renders URLField values as clickable links on changelists and
+read-only change forms. The link was built without validating the URL,
+so a potentially dangerous stored value could be rendered as a link that
+runs script in a staff member's authenticated session when clicked.
+
+The admin renders URLField values as clickable links on changelists and
+read-only change forms. The link was built without validating the URL,
+so a stored value using a potentially dangerous value was rendered as a
+link, which could lead to cross-site scripting in an authenticated admin
+session.
+
+Refs CVE-2019-12308, #36032.
+
+Thanks to Egor Saltykov for the report, and Sarah Boyce for reviews.
+
+Backport of 47511a21026cdd721d8fbf8571cc079bc38bb46d from main.
+
+
+
+## Upstream fix diff (5.2)
+```diff
+diff --git a/django/contrib/admin/utils.py b/django/contrib/admin/utils.py
+index cc8ca5604d..1ce20e3e0a 100644
+--- a/django/contrib/admin/utils.py
++++ b/django/contrib/admin/utils.py
+@@ -3,12 +3,12 @@ import decimal
+ import json
+ from collections import defaultdict
+ from functools import reduce
+ from operator import or_
+ 
+-from django.core.exceptions import FieldDoesNotExist
+-from django.core.validators import EMPTY_VALUES
++from django.core.exceptions import FieldDoesNotExist, ValidationError
++from django.core.validators import EMPTY_VALUES, URLValidator
+ from django.db import models, router
+ from django.db.models.constants import LOOKUP_SEP
+ from django.db.models.deletion import Collector
+ from django.forms.utils import pretty_name
+ from django.urls import NoReverseMatch, reverse
+@@ -453,10 +453,18 @@ def display_for_field(value, field, empty_value_display, avoid_link=False):
+     elif isinstance(field, (models.IntegerField, models.FloatField)):
+         return formats.number_format(value)
+     elif isinstance(field, models.FileField) and value and not avoid_link:
+         return format_html('<a href="{}">{}</a>', value.url, value)
+     elif isinstance(field, models.URLField) and value and not avoid_link:
++        # Only render a clickable link for URLs with a safe scheme, so that a
++        # potentially dangerous stored value is shown as plain text rather than
++        # an executable link. The check is deliberately independent of the
++        # field's own validators, which may permit such schemes.
++        try:
++            URLValidator()(value)
++        except ValidationError:
++            return display_for_value(value, empty_value_display)
+         return format_html('<a href="{}">{}</a>', value, value)
+     elif isinstance(field, models.JSONField) and value:
+         try:
+             return json.dumps(value, ensure_ascii=False, cls=field.encoder)
+         except TypeError:
+
+```
+
+## History of the touched code on 4.2 (git log -L)
+### display_for_field (django/contrib/admin/utils.py:401-435)
+commit 897f38fabe 2022-08-22
+Fixed #33927 -- Fixed crash when displaying ArrayField with choices in admin.
+
+diff --git a/django/contrib/admin/utils.py b/django/contrib/admin/utils.py
+--- a/django/contrib/admin/utils.py
++++ b/django/contrib/admin/utils.py
+@@ -400,28 +401,35 @@
+ def display_for_field(value, field, empty_value_display):
+     from django.contrib.admin.templatetags.admin_list import _boolean_icon
+ 
+     if getattr(field, "flatchoices", None):
+-        return dict(field.flatchoices).get(value, empty_value_display)
++        try:
++            return dict(field.flatchoices).get(value, empty_value_display)
++        except TypeError:
++            # Allow list-like choices.
++            flatchoices = make_hashable(field.flatchoices)
++            value = make_hashable(value)
++            return dict(flatchoices).get(value, empty_value_display)
++
+     # BooleanField needs special-case null-handling, so it comes before the
+     # general null test.
+     elif isinstance(field, models.BooleanField):
+         return _boolean_icon(value)
+     elif value is None:
+         return empty_value_display
+     elif isinstance(field, models.DateTimeField):
+         return formats.localize(timezone.template_localtime(value))
+     elif isinstance(field, (models.DateField, models.TimeField)):
+         return formats.localize(value)
+     elif isinstance(field, models.DecimalField):
+         return formats.number_format(value, field.decimal_places)
+     elif isinstance(field, (models.IntegerField, models.FloatField)):
+         return formats.number_format(value)
+     elif isinstance(field, models.FileField) and value:
+         return format_html('<a href="{}">{}</a>', value.url, value)
+     elif isinstance(field, models.JSONField) and value:
+         try:
+             return json.dumps(value, ensure_ascii=False, cls=field.encoder)
+         except TypeError:
+             return display_for_value(value, empty_value_display)
+     else:
+         return display_for_value(value, empty_value_display)
+commit 9c19aff7c7 2022-02-03
+Refs #33476 -- Reformatted code with Black.
+
+diff --git a/django/contrib/admin/utils.py b/django/contrib/admin/utils.py
+--- a/django/contrib/admin/utils.py
++++ b/django/contrib/admin/utils.py
+@@ -382,28 +400,28 @@
+ def display_for_field(value, field, empty_value_display):
+     from django.contrib.admin.templatetags.admin_list import _boolean_icon
+ 
+-    if getattr(field, 'flatchoices', None):
++    if getattr(field, "flatchoices", None):
+         return dict(field.flatchoices).get(value, empty_value_display)
+     # BooleanField needs special-case null-handling, so it comes before the
+     # general null test.
+     elif isinstance(field, models.BooleanField):
+         return _boolean_icon(value)
+     elif value is None:
+         return empty_value_display
+     elif isinstance(field, models.DateTimeField):
+         return formats.localize(timezone.template_localtime(value))
+     elif isinstance(field, (models.DateField, models.TimeField)):
+         return formats.localize(value)
+     elif isinstance(field, models.DecimalField):
+         return formats.number_format(value, field.decimal_places)
+     elif isinstance(field, (models.IntegerField, models.FloatField)):
+         return formats.number_format(value)
+     elif isinstance(field, models.FileField) and value:
+         return format_html('<a href="{}">{}</a>', value.url, value)
+     elif isinstance(field, models.JSONField) and value:
+         try:
+             return json.dumps(value, ensure_ascii=False, cls=field.encoder)
+         except TypeError:
+             return display_for_value(value, empty_value_display)
+     else:
+         return display_for_value(value, empty_value_display)
+commit de81676b51 2020-10-08
+Fixed #32080 -- Fixed displaying Unicode chars in forms.JSONField and read-only JSONField values in admin.
+
+diff --git a/django/contrib/admin/utils.py b/django/contrib/admin/utils.py
+--- a/django/contrib/admin/utils.py
++++ b/django/contrib/admin/utils.py
+@@ -380,28 +381,28 @@
+ def display_for_field(value, field, empty_value_display):
+     from django.contrib.admin.templatetags.admin_list import _boolean_icon
+ 
+     if getattr(field, 'flatchoices', None):
+         return dict(field.flatchoices).get(value, empty_value_display)
+     # BooleanField needs special-case null-handling, so it comes before the
+     # general null test.
+     elif isinstance(field, models.BooleanField):
+         return _boolean_icon(value)
+     elif value is None:
+         return empty_value_display
+     elif isinstance(field, models.DateTimeField):
+         return formats.localize(timezone.template_localtime(value))
+     elif isinstance(field, (models.DateField, models.TimeField)):
+         return formats.localize(value)
+     elif isinstance(field, models.DecimalField):
+         return formats.number_format(value, field.decimal_places)
+     elif isinstance(field, (models.IntegerField, models.FloatField)):
+         return formats.number_format(value)
+     elif isinstance(field, models.FileField) and value:
+         return format_html('<a href="{}">{}</a>', value.url, value)
+     elif isinstance(field, models.JSONField) and value:
+         try:
+-            return field.get_prep_value(value)
++            return json.dumps(value, ensure_ascii=False, cls=field.encoder)
+         except TypeError:
+             return display_for_value(value, empty_value_display)
+     else:
+         return display_for_value(value, empty_value_display)
+
+
+## The probe fails on 4.2 like this
+Outcome on Django 4.2: FAIL (FAILED (failures=1))
+- hl_cve_2026_15920.tests.URLFieldXSSDisplayTests.test_url_display_safety: AssertionError: '<a' not found in 'http://example.com' : A valid http:// URL should be rendered as a clickable link.
