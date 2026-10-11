@@ -1,0 +1,54 @@
+You are backporting a security fix to Django 4.2 (this checkout is tag 4.2.30).
+Upstream fixed CVE-2026-87975 on the 5.2 branch with the commit below. Django 4.2 does not have Model._is_pk_set();
+adapt the fix to this codebase's idioms. Edit only files under django/. Do NOT edit anything under tests/.
+The failing probe is tests/hl_cve_2026_87975 — run it with: python tests/runtests.py hl_cve_2026_87975 --parallel=1
+Also make sure python tests/runtests.py model_formsets --parallel=1 still passes. Do not commit. Finish with a one-paragraph summary.
+
+Upstream commit:
+commit ff27883ca055aa9ab23015b50674a5b10dfe5a41
+Author: Jacob Walls <jacobtylerwalls@gmail.com>
+Date:   Wed Sep 2 15:49:28 2026 -0400
+
+    [5.2.x] Fixed CVE-2026-87975 -- Prevented forging actions in model formsets with editable PKs.
+    
+    Deleting instances outside a `ModelFormSet`'s queryset was possible by
+    forging POST data for an editable primary key. In the same way, creating
+    instances was possible for edit-only model formsets.
+    
+    An object outside the queryset is represented by a newly constructed
+    instance, but its PK can still be populated: `BaseInlineFormSet` sets
+    the parent link when it's also the primary key, and
+    `construct_instance()` sets any editable primary PK present on the form.
+    `save_existing_objects()` then took the populated primary key as proof
+    that the instance came from the queryset and deleted or persisted the
+    row.
+    
+    This change now checks `_state.adding` to identify instances that did
+    not come from the queryset, whichever way the primary key was populated.
+    Models using the default `AutoField` primary key are not affected.
+    
+    Thanks Seonggwon Yoon for the report and Natalia Bidart for reviews.
+    
+    Backport of 83cbd21be57483e6b3eb6e4688a561c841aff75e from main.
+
+diff --git a/django/forms/models.py b/django/forms/models.py
+index be59dbe4a0..ac144d1ddf 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -931,11 +931,12 @@ class BaseModelFormSet(BaseFormSet, AltersData):
+         forms_to_delete = self.deleted_forms
+         for form in self.initial_forms:
+             obj = form.instance
+-            # If the pk is None, it means either:
+-            # 1. The object is an unexpected empty model, created by invalid
+-            #    POST data such as an object outside the formset's queryset.
++            # If the pk is unset or the instance is being added, it could mean:
++            # 1. The object is an unexpected unfetched instance, created by
++            #    invalid POST data such as an object outside the formset's
++            #    queryset, or a formset with edit_only=True.
+             # 2. The object was already deleted from the database.
+-            if not obj._is_pk_set():
++            if not obj._is_pk_set() or obj._state.adding:
+                 continue
+             if form in forms_to_delete:
+                 self.deleted_objects.append(obj)
