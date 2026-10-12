@@ -1,0 +1,278 @@
+Backport a security fix to Django 4.2 (this checkout: tag 4.2.30 + fork base).
+
+Upstream fixed CVE-2026-87890 on the 5.2 branch with the commit below. Rebuild the same fix
+for 4.2 using this codebase's idioms (4.2 lacks some 5.x helpers; do not add them).
+
+Rules:
+- Keep the fix's observable behaviour identical to upstream: the same exception types
+  and the same user-visible messages (copy new or changed message strings verbatim).
+- Edit only files under django/. Do not create, edit or delete anything under tests/.
+- Do not commit or push.
+- The failing probe is tests/hl_cve_2026_87890. Check with:
+    python tests/runtests.py hl_cve_2026_87890 --parallel=1
+  and keep the touched module's tests passing, e.g.:
+    python tests/runtests.py model_formsets --parallel=1
+- Finish with a one-paragraph summary of the change.
+
+## Upstream commit message (intent)
+[5.2.x] Fixed CVE-2026-87890 -- Blocked bytes in spatial lookups.
+
+Even though raster values provided via bytes write to the in-memory
+virtual filesystem, that does not prevent network fetches when resolving
+references.
+
+Thank you to sicksec for the report, and Jacob Walls, Jake Howard, and
+David Smith for reviews.
+
+Backport of ebcb13b327301f28cbc6cd5e4988a719f00575aa from main.
+
+
+
+## Upstream fix diff (5.2)
+```diff
+diff --git a/django/contrib/gis/db/models/fields.py b/django/contrib/gis/db/models/fields.py
+index 5f30e66c0e..ae0a24fc9e 100644
+--- a/django/contrib/gis/db/models/fields.py
++++ b/django/contrib/gis/db/models/fields.py
+@@ -218,15 +218,19 @@ class BaseSpatialField(Field):
+                     self, "max_geom_collections", MAX_GEOM_COLLECTIONS
+                 )
+                 try:
+                     obj = GEOSGeometry(obj, max_geom_collections=max_geom_collections)
+                 except (TypeError, ValueError) as err:
+-                    if isinstance(obj, str) and obj.startswith(VSI_FILESYSTEM_PREFIX):
++                    if isinstance(obj, bytes) or (
++                        isinstance(obj, str) and obj.startswith(VSI_FILESYSTEM_PREFIX)
++                    ):
+                         raise blocked_err
+                     raise err
+                 except (GEOSException, GDALException):
+-                    if isinstance(obj, str) and json_regex.match(obj):
++                    if isinstance(obj, bytes) or (
++                        isinstance(obj, str) and json_regex.match(obj)
++                    ):
+                         raise blocked_err
+                     raise ValueError(
+                         "Couldn't create spatial object from lookup value '%s'." % obj
+                     )
+             else:
+diff --git a/django/contrib/gis/gdal/raster/source.py b/django/contrib/gis/gdal/raster/source.py
+index 2bcc035f20..b6958fd95e 100644
+--- a/django/contrib/gis/gdal/raster/source.py
++++ b/django/contrib/gis/gdal/raster/source.py
+@@ -32,12 +32,12 @@ from django.utils.encoding import force_bytes, force_str
+ from django.utils.functional import cached_property
+ 
+ 
+ class DisallowedRasterLookup(SuspiciousOperation):
+     """
+-    Types that force GDALRaster to open in write mode (dict) or values that
+-    could be virtual filesystem paths (str) are not allowed in lookup contexts.
++    Types that force GDALRaster to open in write mode or values that could
++    reference external sources, are not allowed in lookup contexts.
+     Instead, wrap values in GDALRaster explicitly.
+     """
+ 
+ 
+ class TransformPoint(list):
+@@ -246,16 +246,23 @@ class GDALRaster(GDALRasterBase):
+     @classmethod
+     def check_raster_lookup_value(cls, ds_input):
+         """
+         Raise DisallowedRasterLookup for values inappropriate in lookups:
+         - No dicts, which GDALRaster(write=False) might still write to.
+-        - No strings or Paths, which might fetch over the virtual filesystem.
++        - No strings, bytes, or Paths, which might fetch over the virtual
++          filesystem.
+         """
+         normalized = cls._preprocess_input(ds_input)
+-        if isinstance(normalized, (dict, str)):
++        if isinstance(normalized, (dict, str, bytes)):
++            value_repr = repr(normalized)
++            if len(value_repr) > 4096:
++                value_repr = "%s… <trimmed %d bytes string>" % (
++                    value_repr[:4096],
++                    len(value_repr),
++                )
+             msg = (
+-                f"Cannot use object {normalized!r} for a spatial lookup "
++                f"Cannot use object {value_repr} for a spatial lookup "
+                 "parameter. If this is a raster, wrap it with GDALRaster() "
+                 "before using it in a lookup to enable writing or fetching."
+             )
+             raise DisallowedRasterLookup(msg)
+ 
+
+```
+
+## History of the touched code on 4.2 (git log -L)
+### BaseSpatialField.get_prep_value (django/contrib/gis/db/models/fields.py:190-237)
+commit 96166f2ccc 2026-10-12
+[4.2.x] Fixed CVE-2026-15307 -- Blocked raster strings and dicts in spatial lookups.
+
+diff --git a/django/contrib/gis/db/models/fields.py b/django/contrib/gis/db/models/fields.py
+--- a/django/contrib/gis/db/models/fields.py
++++ b/django/contrib/gis/db/models/fields.py
+@@ -189,34 +190,48 @@
+     def get_prep_value(self, value):
+         obj = super().get_prep_value(value)
+         if obj is None:
+             return None
+         # When the input is not a geometry or raster, attempt to construct one
+         # from the given string input.
+         if isinstance(obj, GEOSGeometry):
+             pass
+         else:
+             # Check if input is a candidate for conversion to raster or geometry.
+             is_candidate = isinstance(obj, (bytes, str)) or hasattr(
+                 obj, "__geo_interface__"
+             )
+             # Try to convert the input to raster.
+-            raster = self.get_raster_prep_value(obj, is_candidate)
+-
++            raster = None
++            blocked_err = None
++            try:
++                raster = self.get_raster_prep_value(obj, is_candidate)
++            except DisallowedRasterLookup as err:
++                if isinstance(obj, dict):
++                    raise err
++                # Don't immediately raise in case this is a valid GEOSGeometry.
++                blocked_err = err
+             if raster:
+                 obj = raster
+             elif is_candidate:
+                 try:
+                     obj = GEOSGeometry(obj)
++                except (TypeError, ValueError) as err:
++                    if isinstance(obj, str) and obj.startswith(VSI_FILESYSTEM_PREFIX):
++                        raise blocked_err
++                    raise err
+                 except (GEOSException, GDALException):
++                    if isinstance(obj, str) and json_regex.match(obj):
++                        raise blocked_err
+                     raise ValueError(
+                         "Couldn't create spatial object from lookup value '%s'." % obj
+                     )
+             else:
+-                raise ValueError(
++                msg = (
+                     "Cannot use object with type %s for a spatial lookup parameter."
+                     % type(obj).__name__
+                 )
++                raise blocked_err or ValueError(msg)
+ 
+         # Assigning the SRID value.
+         obj.srid = self.get_srid(obj)
+         return obj
+commit 9c19aff7c7 2022-02-03
+Refs #33476 -- Reformatted code with Black.
+
+diff --git a/django/contrib/gis/db/models/fields.py b/django/contrib/gis/db/models/fields.py
+--- a/django/contrib/gis/db/models/fields.py
++++ b/django/contrib/gis/db/models/fields.py
+@@ -172,27 +191,34 @@
+     def get_prep_value(self, value):
+         obj = super().get_prep_value(value)
+         if obj is None:
+             return None
+         # When the input is not a geometry or raster, attempt to construct one
+         # from the given string input.
+         if isinstance(obj, GEOSGeometry):
+             pass
+         else:
+             # Check if input is a candidate for conversion to raster or geometry.
+-            is_candidate = isinstance(obj, (bytes, str)) or hasattr(obj, '__geo_interface__')
++            is_candidate = isinstance(obj, (bytes, str)) or hasattr(
++                obj, "__geo_interface__"
++            )
+             # Try to convert the input to raster.
+             raster = self.get_raster_prep_value(obj, is_candidate)
+ 
+             if raster:
+                 obj = raster
+             elif is_candidate:
+                 try:
+                     obj = GEOSGeometry(obj)
+                 except (GEOSException, GDALException):
+-                    raise ValueError("Couldn't create spatial object from lookup value '%s'." % obj)
++                    raise ValueError(
++                        "Couldn't create spatial object from lookup value '%s'." % obj
++                    )
+             else:
+-                raise ValueError('Cannot use object with type %s for a spatial lookup parameter.' % type(obj).__name__)
++                raise ValueError(
++                    "Cannot use object with type %s for a spatial lookup parameter."
++                    % type(obj).__name__
++                )
+ 
+         # Assigning the SRID value.
+         obj.srid = self.get_srid(obj)
+         return obj
+commit da71e4bb08 2017-12-06
+Fixed #28896 -- Reallowed filtering a queryset with GeometryField=None.
+
+diff --git a/django/contrib/gis/db/models/fields.py b/django/contrib/gis/db/models/fields.py
+--- a/django/contrib/gis/db/models/fields.py
++++ b/django/contrib/gis/db/models/fields.py
+@@ -168,25 +168,27 @@
+     def get_prep_value(self, value):
+         obj = super().get_prep_value(value)
++        if obj is None:
++            return None
+         # When the input is not a geometry or raster, attempt to construct one
+         # from the given string input.
+         if isinstance(obj, GEOSGeometry):
+             pass
+         else:
+             # Check if input is a candidate for conversion to raster or geometry.
+             is_candidate = isinstance(obj, (bytes, str)) or hasattr(obj, '__geo_interface__')
+             # Try to convert the input to raster.
+             raster = self.get_raster_prep_value(obj, is_candidate)
+ 
+             if raster:
+                 obj = raster
+             elif is_candidate:
+                 try:
+                     obj = GEOSGeometry(obj)
+                 except (GEOSException, GDALException):
+                     raise ValueError("Couldn't create spatial object from lookup value '%s'." % obj)
+             else:
+                 raise ValueError('Cannot use object with type %s for a spatial lookup parameter.' % type(obj).__name__)
+ 
+         # Assigning the SRID value.
+         obj.srid = self.get_srid(obj)
+         return obj
+
+
+### GDALRaster.check_raster_lookup_value (django/contrib/gis/gdal/raster/source.py:247-261)
+commit 96166f2ccc 2026-10-12
+[4.2.x] Fixed CVE-2026-15307 -- Blocked raster strings and dicts in spatial lookups.
+
+diff --git a/django/contrib/gis/gdal/raster/source.py b/django/contrib/gis/gdal/raster/source.py
+--- a/django/contrib/gis/gdal/raster/source.py
++++ b/django/contrib/gis/gdal/raster/source.py
+@@ -229,0 +247,15 @@
++    @classmethod
++    def check_raster_lookup_value(cls, ds_input):
++        """
++        Raise DisallowedRasterLookup for values inappropriate in lookups:
++        - No dicts, which GDALRaster(write=False) might still write to.
++        - No strings or Paths, which might fetch over the virtual filesystem.
++        """
++        normalized = cls._preprocess_input(ds_input)
++        if isinstance(normalized, (dict, str)):
++            msg = (
++                f"Cannot use object {normalized!r} for a spatial lookup "
++                "parameter. If this is a raster, wrap it with GDALRaster() "
++                "before using it in a lookup to enable writing or fetching."
++            )
++            raise DisallowedRasterLookup(msg)
+
+
+## The probe fails on 4.2 like this
+Outcome on Django 4.2: FAIL (FAILED (failures=4))
+- hl_cve_2026_87890.tests.BytesRejectedInSpatialLookupTest.test_arbitrary_bytes_rejected: AssertionError: DisallowedRasterLookup was not raised for binary bytes input. CVE-2026-87890: bytes must be rejected in spatial lookups.
+- hl_cve_2026_87890.tests.BytesRejectedInSpatialLookupTest.test_get_prep_value_executes_check: AssertionError: DisallowedRasterLookup was not raised for bytes b'POINT (invalid)'. CVE-2026-87890: get_prep_value must reject bytes via DisallowedRasterLookup. raised_other=True
+- hl_cve_2026_87890.tests.BytesRejectedInSpatialLookupTest.test_large_bytes_rejected: AssertionError: DisallowedRasterLookup was not raised for large bytes input. CVE-2026-87890: bytes must be rejected in spatial lookups.
+- hl_cve_2026_87890.tests.BytesRejectedInSpatialLookupTest.test_plain_bytes_rejected: AssertionError: DisallowedRasterLookup was not raised for bytes input. CVE-2026-87890: bytes must be rejected in spatial lookups.
