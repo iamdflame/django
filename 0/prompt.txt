@@ -1,0 +1,714 @@
+Backport a security fix to Django 4.2 (this checkout: tag 4.2.30 + fork base).
+
+Upstream fixed CVE-2026-15307 on the 5.2 branch with the commit below. Rebuild the same fix
+for 4.2 using this codebase's idioms (4.2 lacks some 5.x helpers; do not add them).
+
+Rules:
+- Keep the fix's observable behaviour identical to upstream: the same exception types
+  and the same user-visible messages (copy new or changed message strings verbatim).
+- Edit only files under django/. Do not create, edit or delete anything under tests/.
+- Do not commit or push.
+- The failing probe is tests/hl_cve_2026_15307. Check with:
+    python tests/runtests.py hl_cve_2026_15307 --parallel=1
+  and keep the touched module's tests passing, e.g.:
+    python tests/runtests.py model_formsets --parallel=1
+- Finish with a one-paragraph summary of the change.
+
+## Upstream commit message (intent)
+[5.2.x] Fixed CVE-2026-15307 -- Blocked raster strings and dicts in spatial lookups.
+
+Spatial lookups optimistically parse values as rasters before retrying
+as geometries. If a malicious value reached the GDALRaster constructor,
+depending on the raster driver, it might write to disk or fetch from the
+network regardless of the constructor's `write=False` default argument.
+
+Although this works as designed for model field assignment, this is
+potentially unexpected for querying, for example, in the admin's
+changelist view, which allows staff users to execute arbitrary lookups
+on models registered with the admin.
+
+Network rasters didn't even work in lookup contexts before, providing
+further evidence that this use case was unintentional. (The failure
+point was after the fetching, however.)
+
+Now, strings and dicts representing rasters are rejected by spatial
+lookups. To opt in to using them, wrap them in a `GDALRaster` first.
+
+Although it would simplify the implementation to try geometries before
+rasters (instead of stashing a raster exception and raising it later),
+we maintain the current order, which has been stable for a decade.
+
+Thanks Bence Nagy, localhost-detect, and kimchunbok_ for providing
+information useful in evaluating this report. Thanks Simon Charette,
+Natalia Bidart, and Sarah Boyce for reviews.
+
+Backport of f1949c1f9758947ade984c895ff16bef46f56520 from main.
+
+
+
+## Upstream fix diff (5.2)
+```diff
+diff --git a/django/contrib/gis/db/models/fields.py b/django/contrib/gis/db/models/fields.py
+index 812029de49..597614b20d 100644
+--- a/django/contrib/gis/db/models/fields.py
++++ b/django/contrib/gis/db/models/fields.py
+@@ -1,10 +1,13 @@
+ from collections import defaultdict, namedtuple
+ 
+ from django.contrib.gis import forms, gdal
+ from django.contrib.gis.db.models.proxy import SpatialProxy
+ from django.contrib.gis.gdal.error import GDALException
++from django.contrib.gis.gdal.raster.const import VSI_FILESYSTEM_PREFIX
++from django.contrib.gis.gdal.raster.source import DisallowedRasterLookup
++from django.contrib.gis.geometry import json_regex
+ from django.contrib.gis.geos import (
+     GeometryCollection,
+     GEOSException,
+     GEOSGeometry,
+     LineString,
+@@ -168,25 +171,23 @@ class BaseSpatialField(Field):
+         )
+ 
+     def get_raster_prep_value(self, value, is_candidate):
+         """
+         Return a GDALRaster if conversion is successful, otherwise return None.
++
++        Unless the user opts in by wrapping values in a GDALRaster, raise
++        DisallowedRasterLookup for values that fetch or write to disk.
+         """
+         if isinstance(value, gdal.GDALRaster):
+             return value
+-        elif is_candidate:
++        gdal.GDALRaster.check_raster_lookup_value(value)
++        if is_candidate:
+             try:
+                 return gdal.GDALRaster(value)
+             except GDALException:
+                 pass
+-        elif isinstance(value, dict):
+-            try:
+-                return gdal.GDALRaster(value)
+-            except GDALException:
+-                raise ValueError(
+-                    "Couldn't create spatial object from lookup value '%s'." % value
+-                )
++        return None
+ 
+     def get_prep_value(self, value):
+         obj = super().get_prep_value(value)
+         if obj is None:
+             return None
+@@ -198,26 +199,40 @@ class BaseSpatialField(Field):
+             # Check if input is a candidate for conversion to raster or geometry.
+             is_candidate = isinstance(obj, (bytes, str)) or hasattr(
+                 obj, "__geo_interface__"
+             )
+             # Try to convert the input to raster.
+-            raster = self.get_raster_prep_value(obj, is_candidate)
+-
++            raster = None
++            blocked_err = None
++            try:
++                raster = self.get_raster_prep_value(obj, is_candidate)
++            except DisallowedRasterLookup as err:
++                if isinstance(obj, dict):
++                    raise err
++                # Don't immediately raise in case this is a valid GEOSGeometry.
++                blocked_err = err
+             if raster:
+                 obj = raster
+             elif is_candidate:
+                 try:
+                     obj = GEOSGeometry(obj)
++                except (TypeError, ValueError) as err:
++                    if isinstance(obj, str) and obj.startswith(VSI_FILESYSTEM_PREFIX):
++                        raise blocked_err
++                    raise err
+                 except (GEOSException, GDALException):
++                    if isinstance(obj, str) and json_regex.match(obj):
++                        raise blocked_err
+                     raise ValueError(
+                         "Couldn't create spatial object from lookup value '%s'." % obj
+                     )
+             else:
+-                raise ValueError(
++                msg = (
+                     "Cannot use object with type %s for a spatial lookup parameter."
+                     % type(obj).__name__
+                 )
++                raise blocked_err or ValueError(msg)
+ 
+         # Assigning the SRID value.
+         obj.srid = self.get_srid(obj)
+         return obj
+ 
+diff --git a/django/contrib/gis/gdal/raster/source.py b/django/contrib/gis/gdal/raster/source.py
+index bff8128129..f89928fbb5 100644
+--- a/django/contrib/gis/gdal/raster/source.py
++++ b/django/contrib/gis/gdal/raster/source.py
+@@ -25,14 +25,23 @@ from django.contrib.gis.gdal.raster.const import (
+     VSI_MEM_FILESYSTEM_BASE_PATH,
+     VSI_TAKE_BUFFER_OWNERSHIP,
+ )
+ from django.contrib.gis.gdal.srs import SpatialReference, SRSException
+ from django.contrib.gis.geometry import json_regex
++from django.core.exceptions import SuspiciousOperation
+ from django.utils.encoding import force_bytes, force_str
+ from django.utils.functional import cached_property
+ 
+ 
++class DisallowedRasterLookup(SuspiciousOperation):
++    """
++    Types that force GDALRaster to open in write mode (dict) or values that
++    could be virtual filesystem paths (str) are not allowed in lookup contexts.
++    Instead, wrap values in GDALRaster explicitly.
++    """
++
++
+ class TransformPoint(list):
+     indices = {
+         "origin": (0, 3),
+         "scale": (1, 5),
+         "skew": (2, 4),
+@@ -75,18 +84,14 @@ class GDALRaster(GDALRasterBase):
+ 
+     def __init__(self, ds_input, write=False):
+         self._write = 1 if write else 0
+         Driver.ensure_registered()
+ 
+-        # Preprocess json inputs. This converts json strings to dictionaries,
+-        # which are parsed below the same way as direct dictionary inputs.
+-        if isinstance(ds_input, str) and json_regex.match(ds_input):
+-            ds_input = json.loads(ds_input)
++        ds_input = self._preprocess_input(ds_input)
+ 
+         # If input is a valid file path, try setting file as source.
+-        if isinstance(ds_input, (str, Path)):
+-            ds_input = str(ds_input)
++        if isinstance(ds_input, str):
+             if not ds_input.startswith(VSI_FILESYSTEM_PREFIX) and not os.path.exists(
+                 ds_input
+             ):
+                 raise GDALException(
+                     'Unable to read raster source input "%s".' % ds_input
+@@ -223,10 +228,39 @@ class GDALRaster(GDALRasterBase):
+         """
+         Short-hand representation because WKB may be very large.
+         """
+         return "<Raster object at %s>" % hex(addressof(self._ptr))
+ 
++    @classmethod
++    def _preprocess_input(cls, ds_input):
++        """
++        Preprocess json and Path inputs. This converts json strings to
++        dictionaries, which are then parsed just like direct dictionary inputs.
++        This also stringifies Path objects.
++        """
++        if isinstance(ds_input, str) and json_regex.match(ds_input):
++            ds_input = json.loads(ds_input)
++        if isinstance(ds_input, Path):
++            ds_input = str(ds_input)
++        return ds_input
++
++    @classmethod
++    def check_raster_lookup_value(cls, ds_input):
++        """
++        Raise DisallowedRasterLookup for values inappropriate in lookups:
++        - No dicts, which GDALRaster(write=False) might still write to.
++        - No strings or Paths, which might fetch over the virtual filesystem.
++        """
++        normalized = cls._preprocess_input(ds_input)
++        if isinstance(normalized, (dict, str)):
++            msg = (
++                f"Cannot use object {normalized!r} for a spatial lookup "
++                "parameter. If this is a raster, wrap it with GDALRaster() "
++                "before using it in a lookup to enable writing or fetching."
++            )
++            raise DisallowedRasterLookup(msg)
++
+     def _flush(self):
+         """
+         Flush all data from memory into the source file if it exists.
+         The data that needs flushing are geotransforms, coordinate systems,
+         nodata_values and pixel values. This function will be called
+
+```
+
+## History of the touched code on 4.2 (git log -L)
+### BaseSpatialField.get_raster_prep_value (django/contrib/gis/db/models/fields.py:170-187)
+commit 9c19aff7c7 2022-02-03
+Refs #33476 -- Reformatted code with Black.
+
+diff --git a/django/contrib/gis/db/models/fields.py b/django/contrib/gis/db/models/fields.py
+--- a/django/contrib/gis/db/models/fields.py
++++ b/django/contrib/gis/db/models/fields.py
+@@ -155,16 +172,18 @@
+     def get_raster_prep_value(self, value, is_candidate):
+         """
+         Return a GDALRaster if conversion is successful, otherwise return None.
+         """
+         if isinstance(value, gdal.GDALRaster):
+             return value
+         elif is_candidate:
+             try:
+                 return gdal.GDALRaster(value)
+             except GDALException:
+                 pass
+         elif isinstance(value, dict):
+             try:
+                 return gdal.GDALRaster(value)
+             except GDALException:
+-                raise ValueError("Couldn't create spatial object from lookup value '%s'." % value)
++                raise ValueError(
++                    "Couldn't create spatial object from lookup value '%s'." % value
++                )
+commit 6e4c6281db 2017-09-07
+Reverted "Fixed #27818 -- Replaced try/except/pass with contextlib.suppress()."
+
+diff --git a/django/contrib/gis/db/models/fields.py b/django/contrib/gis/db/models/fields.py
+--- a/django/contrib/gis/db/models/fields.py
++++ b/django/contrib/gis/db/models/fields.py
+@@ -153,14 +152,16 @@
+     def get_raster_prep_value(self, value, is_candidate):
+         """
+         Return a GDALRaster if conversion is successful, otherwise return None.
+         """
+         if isinstance(value, gdal.GDALRaster):
+             return value
+         elif is_candidate:
+-            with suppress(GDALException):
++            try:
+                 return gdal.GDALRaster(value)
++            except GDALException:
++                pass
+         elif isinstance(value, dict):
+             try:
+                 return gdal.GDALRaster(value)
+             except GDALException:
+                 raise ValueError("Couldn't create spatial object from lookup value '%s'." % value)
+commit 550cb3a365 2017-03-09
+Fixed #27818 -- Replaced try/except/pass with contextlib.suppress().
+
+diff --git a/django/contrib/gis/db/models/fields.py b/django/contrib/gis/db/models/fields.py
+--- a/django/contrib/gis/db/models/fields.py
++++ b/django/contrib/gis/db/models/fields.py
+@@ -167,16 +168,14 @@
+     def get_raster_prep_value(self, value, is_candidate):
+         """
+         Return a GDALRaster if conversion is successful, otherwise return None.
+         """
+         if isinstance(value, gdal.GDALRaster):
+             return value
+         elif is_candidate:
+-            try:
++            with suppress(GDALException):
+                 return gdal.GDALRaster(value)
+-            except GDALException:
+-                pass
+         elif isinstance(value, dict):
+             try:
+                 return gdal.GDALRaster(value)
+             except GDALException:
+                 raise ValueError("Couldn't create spatial object from lookup value '%s'." % value)
+
+
+### BaseSpatialField.get_prep_value (django/contrib/gis/db/models/fields.py:189-222)
+commit 9c19aff7c7 2022-02-03
+Refs #33476 -- Reformatted code with Black.
+
+diff --git a/django/contrib/gis/db/models/fields.py b/django/contrib/gis/db/models/fields.py
+--- a/django/contrib/gis/db/models/fields.py
++++ b/django/contrib/gis/db/models/fields.py
+@@ -172,27 +191,34 @@
+     def get_prep_value(self, value):
+         obj = super().get_prep_value(value)
+         if obj is None:
+             return None
+         # When the input is not a geometry or raster, attempt to construct one
+         # from the given string input.
+         if isinstance(obj, GEOSGeometry):
+             pass
+         else:
+             # Check if input is a candidate for conversion to raster or geometry.
+-            is_candidate = isinstance(obj, (bytes, str)) or hasattr(obj, '__geo_interface__')
++            is_candidate = isinstance(obj, (bytes, str)) or hasattr(
++                obj, "__geo_interface__"
++            )
+             # Try to convert the input to raster.
+             raster = self.get_raster_prep_value(obj, is_candidate)
+ 
+             if raster:
+                 obj = raster
+             elif is_candidate:
+                 try:
+                     obj = GEOSGeometry(obj)
+                 except (GEOSException, GDALException):
+-                    raise ValueError("Couldn't create spatial object from lookup value '%s'." % obj)
++                    raise ValueError(
++                        "Couldn't create spatial object from lookup value '%s'." % obj
++                    )
+             else:
+-                raise ValueError('Cannot use object with type %s for a spatial lookup parameter.' % type(obj).__name__)
++                raise ValueError(
++                    "Cannot use object with type %s for a spatial lookup parameter."
++                    % type(obj).__name__
++                )
+ 
+         # Assigning the SRID value.
+         obj.srid = self.get_srid(obj)
+         return obj
+commit da71e4bb08 2017-12-06
+Fixed #28896 -- Reallowed filtering a queryset with GeometryField=None.
+
+diff --git a/django/contrib/gis/db/models/fields.py b/django/contrib/gis/db/models/fields.py
+--- a/django/contrib/gis/db/models/fields.py
++++ b/django/contrib/gis/db/models/fields.py
+@@ -168,25 +168,27 @@
+     def get_prep_value(self, value):
+         obj = super().get_prep_value(value)
++        if obj is None:
++            return None
+         # When the input is not a geometry or raster, attempt to construct one
+         # from the given string input.
+         if isinstance(obj, GEOSGeometry):
+             pass
+         else:
+             # Check if input is a candidate for conversion to raster or geometry.
+             is_candidate = isinstance(obj, (bytes, str)) or hasattr(obj, '__geo_interface__')
+             # Try to convert the input to raster.
+             raster = self.get_raster_prep_value(obj, is_candidate)
+ 
+             if raster:
+                 obj = raster
+             elif is_candidate:
+                 try:
+                     obj = GEOSGeometry(obj)
+                 except (GEOSException, GDALException):
+                     raise ValueError("Couldn't create spatial object from lookup value '%s'." % obj)
+             else:
+                 raise ValueError('Cannot use object with type %s for a spatial lookup parameter.' % type(obj).__name__)
+ 
+         # Assigning the SRID value.
+         obj.srid = self.get_srid(obj)
+         return obj
+commit f896eb30f6 2017-09-10
+Removed django.contrib.gis.geometry.backend.
+
+diff --git a/django/contrib/gis/db/models/fields.py b/django/contrib/gis/db/models/fields.py
+--- a/django/contrib/gis/db/models/fields.py
++++ b/django/contrib/gis/db/models/fields.py
+@@ -169,25 +168,25 @@
+     def get_prep_value(self, value):
+         obj = super().get_prep_value(value)
+         # When the input is not a geometry or raster, attempt to construct one
+         # from the given string input.
+-        if isinstance(obj, Geometry):
++        if isinstance(obj, GEOSGeometry):
+             pass
+         else:
+             # Check if input is a candidate for conversion to raster or geometry.
+             is_candidate = isinstance(obj, (bytes, str)) or hasattr(obj, '__geo_interface__')
+             # Try to convert the input to raster.
+             raster = self.get_raster_prep_value(obj, is_candidate)
+ 
+             if raster:
+                 obj = raster
+             elif is_candidate:
+                 try:
+-                    obj = Geometry(obj)
+-                except (GeometryException, GDALException):
++                    obj = GEOSGeometry(obj)
++                except (GEOSException, GDALException):
+                     raise ValueError("Couldn't create spatial object from lookup value '%s'." % obj)
+             else:
+                 raise ValueError('Cannot use object with type %s for a spatial lookup parameter.' % type(obj).__name__)
+ 
+         # Assigning the SRID value.
+         obj.srid = self.get_srid(obj)
+         return obj
+
+
+### GDALRaster.__init__ (django/contrib/gis/gdal/raster/source.py:77-212)
+commit 2d23a07817 2022-07-25
+Fixed #33866 -- Added pathlib.Path support to GDALRaster constructor.
+
+diff --git a/django/contrib/gis/gdal/raster/source.py b/django/contrib/gis/gdal/raster/source.py
+--- a/django/contrib/gis/gdal/raster/source.py
++++ b/django/contrib/gis/gdal/raster/source.py
+@@ -76,135 +77,136 @@
+     def __init__(self, ds_input, write=False):
+         self._write = 1 if write else 0
+         Driver.ensure_registered()
+ 
+         # Preprocess json inputs. This converts json strings to dictionaries,
+         # which are parsed below the same way as direct dictionary inputs.
+         if isinstance(ds_input, str) and json_regex.match(ds_input):
+             ds_input = json.loads(ds_input)
+ 
+         # If input is a valid file path, try setting file as source.
+-        if isinstance(ds_input, str):
++        if isinstance(ds_input, (str, Path)):
++            ds_input = str(ds_input)
+             if not ds_input.startswith(VSI_FILESYSTEM_PREFIX) and not os.path.exists(
+                 ds_input
+             ):
+                 raise GDALException(
+                     'Unable to read raster source input "%s".' % ds_input
+                 )
+             try:
+                 # GDALOpen will auto-detect the data source type.
+                 self._ptr = capi.open_ds(force_bytes(ds_input), self._write)
+             except GDALException as err:
+                 raise GDALException(
+                     'Could not open the datasource at "{}" ({}).'.format(ds_input, err)
+                 )
+         elif isinstance(ds_input, bytes):
+             # Create a new raster in write mode.
+             self._write = 1
+             # Get size of buffer.
+             size = sys.getsizeof(ds_input)
+             # Pass data to ctypes, keeping a reference to the ctypes object so
+             # that the vsimem file remains available until the GDALRaster is
+             # deleted.
+             self._ds_input = c_buffer(ds_input)
+             # Create random name to reference in vsimem filesystem.
+             vsi_path = os.path.join(VSI_MEM_FILESYSTEM_BASE_PATH, str(uuid.uuid4()))
+             # Create vsimem file from buffer.
+             capi.create_vsi_file_from_mem_buffer(
+                 force_bytes(vsi_path),
+                 byref(self._ds_input),
+                 size,
+                 VSI_TAKE_BUFFER_OWNERSHIP,
+             )
+             # Open the new vsimem file as a GDALRaster.
+             try:
+                 self._ptr = capi.open_ds(force_bytes(vsi_path), self._write)
+             except GDALException:
+                 # Remove the broken file from the VSI filesystem.
+                 capi.unlink_vsi_file(force_bytes(vsi_path))
+                 raise GDALException("Failed creating VSI raster from the input buffer.")
+         elif isinstance(ds_input, dict):
+             # A new raster needs to be created in write mode
+             self._write = 1
+ 
+             # Create driver (in memory by default)
+             driver = Driver(ds_input.get("driver", "MEM"))
+ 
+             # For out of memory drivers, check filename argument
+             if driver.name != "MEM" and "name" not in ds_input:
+                 raise GDALException(
+                     'Specify name for creation of raster with driver "{}".'.format(
+                         driver.name
+                     )
+                 )
+ 
+             # Check if width and height where specified
+             if "width" not in ds_input or "height" not in ds_input:
+                 raise GDALException(
+                     "Specify width and height attributes for JSON or dict input."
+                 )
+ 
+             # Check if srid was specified
+             if "srid" not in ds_input:
+                 raise GDALException("Specify srid for JSON or dict input.")
+ 
+             # Create null terminated gdal options array.
+             papsz_options = []
+             for key, val in ds_input.get("papsz_options", {}).items():
+                 option = "{}={}".format(key, val)
+                 papsz_options.append(option.upper().encode())
+             papsz_options.append(None)
+ 
+             # Convert papszlist to ctypes array.
+             papsz_options = (c_char_p * len(papsz_options))(*papsz_options)
+ 
+             # Create GDAL Raster
+             self._ptr = capi.create_ds(
+                 driver._ptr,
+                 force_bytes(ds_input.get("name", "")),
+                 ds_input["width"],
+                 ds_input["height"],
+                 ds_input.get("nr_of_bands", len(ds_input.get("bands", []))),
+                 ds_input.get("datatype", 6),
+                 byref(papsz_options),
+             )
+ 
+             # Set band data if provided
+             for i, band_input in enumerate(ds_input.get("bands", [])):
+                 band = self.bands[i]
+                 if "nodata_value" in band_input:
+                     band.nodata_value = band_input["nodata_value"]
+                     # Instantiate band filled with nodata values if only
+                     # partial input data has been provided.
+                     if band.nodata_value is not None and (
+                         "data" not in band_input
+                         or "size" in band_input
+                         or "shape" in band_input
+                     ):
+                         band.data(data=(band.nodata_value,), shape=(1, 1))
+                 # Set band data values from input.
+                 band.data(
+                     data=band_input.get("data"),
+                     size=band_input.get("size"),
+                     shape=band_input.get("shape"),
+                     offset=band_input.get("offset"),
+                 )
+ 
+             # Set SRID
+             self.srs = ds_input.get("srid")
+ 
+             # Set additional properties if provided
+             if "origin" in ds_input:
+                 self.origin.x, self.origin.y = ds_input["origin"]
+ 
+             if "scale" in ds_input:
+                 self.scale.x, self.scale.y = ds_input["scale"]
+ 
+
+
+### GDALRaster (django/contrib/gis/gdal/raster/source.py:70-541)
+commit 2d23a07817 2022-07-25
+Fixed #33866 -- Added pathlib.Path support to GDALRaster constructor.
+
+diff --git a/django/contrib/gis/gdal/raster/source.py b/django/contrib/gis/gdal/raster/source.py
+--- a/django/contrib/gis/gdal/raster/source.py
++++ b/django/contrib/gis/gdal/raster/source.py
+@@ -69,471 +70,472 @@
+ class GDALRaster(GDALRasterBase):
+     """
+     Wrap a raster GDAL Data Source object.
+     """
+ 
+     destructor = capi.close_ds
+ 
+     def __init__(self, ds_input, write=False):
+         self._write = 1 if write else 0
+         Driver.ensure_registered()
+ 
+         # Preprocess json inputs. This converts json strings to dictionaries,
+         # which are parsed below the same way as direct dictionary inputs.
+         if isinstance(ds_input, str) and json_regex.match(ds_input):
+             ds_input = json.loads(ds_input)
+ 
+         # If input is a valid file path, try setting file as source.
+-        if isinstance(ds_input, str):
++        if isinstance(ds_input, (str, Path)):
++            ds_input = str(ds_input)
+             if not ds_input.startswith(VSI_FILESYSTEM_PREFIX) and not os.path.exists(
+                 ds_input
+             ):
+                 raise GDALException(
+                     'Unable to read raster source input "%s".' % ds_input
+                 )
+             try:
+                 # GDALOpen will auto-detect the data source type.
+                 self._ptr = capi.open_ds(force_bytes(ds_input), self._write)
+             except GDALException as err:
+                 raise GDALException(
+                     'Could not open the datasource at "{}" ({}).'.format(ds_input, err)
+                 )
+         elif isinstance(ds_input, bytes):
+             # Create a new raster in write mode.
+             self._write = 1
+             # Get size of buffer.
+             size = sys.getsizeof(ds_input)
+             # Pass data to ctypes, keeping a reference to the ctypes object so
+             # that the vsimem file remains available until the GDALRaster is
+             # deleted.
+             self._ds_input = c_buffer(ds_input)
+             # Create random name to reference in vsimem filesystem.
+             vsi_path = os.path.join(VSI_MEM_FILESYSTEM_BASE_PATH, str(uuid.uuid4()))
+             # Create vsimem file from buffer.
+             capi.create_vsi_file_from_mem_buffer(
+                 force_bytes(vsi_path),
+                 byref(self._ds_input),
+                 size,
+                 VSI_TAKE_BUFFER_OWNERSHIP,
+             )
+             # Open the new vsimem file as a GDALRaster.
+             try:
+                 self._ptr = capi.open_ds(force_bytes(vsi_path), self._write)
+             except GDALException:
+                 # Remove the broken file from the VSI filesystem.
+                 capi.unlink_vsi_file(force_bytes(vsi_path))
+                 raise GDALException("Failed creating VSI raster from the input buffer.")
+         elif isinstance(ds_input, dict):
+             # A new raster needs to be created in write mode
+             self._write = 1
+ 
+             # Create driver (in memory by default)
+             driver = Driver(ds_input.get("driver", "MEM"))
+ 
+             # For out of memory drivers, check filename argument
+             if driver.name != "MEM" and "name" not in ds_input:
+                 raise GDALException(
+                     'Specify name for creation of raster with driver "{}".'.format(
+                         driver.name
+                     )
+                 )
+ 
+             # Check if width and height where specified
+             if "width" not in ds_input or "height" not in ds_input:
+                 raise GDALException(
+                     "Specify width and height attributes for JSON or dict input."
+                 )
+ 
+             # Check if srid was specified
+             if "srid" not in ds_input:
+                 raise GDALException("Specify srid for JSON or dict input.")
+ 
+             # Create null terminated gdal options array.
+             papsz_options = []
+             for key, val in ds_input.get("papsz_options", {}).items():
+                 option = "{}={}".format(key, val)
+                 papsz_options.append(option.upper().encode())
+             papsz_options.append(None)
+ 
+             # Convert papszlist to ctypes array.
+             papsz_options = (c_char_p * len(papsz_options))(*papsz_options)
+ 
+             # Create GDAL Raster
+             self._ptr = capi.create_ds(
+                 driver._ptr,
+                 force_bytes(ds_input.get("name", "")),
+                 ds_input["width"],
+                 ds_input["height"],
+                 ds_input.get("nr_of_bands", len(ds_input.get("bands", []))),
+                 ds_input.get("datatype", 6),
+                 byref(papsz_options),
+             )
+ 
+             # Set band data if provided
+             for i, band_input in enumerate(ds_input.get("bands", [])):
+                 band = self.bands[i]
+                 if "nodata_value" in band_input:
+                     band.nodata_value = band_input["nodata_value"]
+                     # Instantiate band filled with nodata values if only
+                     # partial input data has been provided.
+                     if band.nodata_value is not None and (
+                         "data" not in band_input
+                         or "size" in band_input
+                         or "shape" in band_input
+                     ):
+                         band.data(data=(band.nodata_value,), shape=(1, 1))
+                 # Set band data values from input.
+                 band.data(
+                     data=band_input.get("data"),
+                     size=band_input.get("size"),
+                     shape=band_input.get("shape"),
+                     offset=band_input.get("offset"),
+                 )
+ 
+             # Set SRID
+             self.srs = ds_input.get("srid")
+ 
+             # Set additional properties if provided
+             if "origin" in ds_input:
+                 self.origin.x, self.or
+
+## The probe fails on 4.2 like this
+Outcome on Django 4.2: FAIL (FAILED (failures=4))
+- hl_cve_2026_15307.tests.CVE202615307SpatialLookupTest.test_dict_input_raises_suspicious_operation: AssertionError: VULNERABLE: get_prep_value accepted a dict without raising SuspiciousOperation (CVE-2026-15307). The dict was forwarded to GDALRaster, enabling server-side file writes.
+- hl_cve_2026_15307.tests.CVE202615307SpatialLookupTest.test_json_raster_string_raises_suspicious_operation: AssertionError: VULNERABLE: get_prep_value accepted a JSON raster string without raising SuspiciousOperation (CVE-2026-15307). The string was forwarded to GDALRaster, enabling server-side file writes.
+- hl_cve_2026_15307.tests.CVE202615307SpatialLookupTest.test_vsicurl_string_raises_suspicious_operation: AssertionError: VULNERABLE: get_prep_value accepted a /vsicurl/ string without raising SuspiciousOperation (CVE-2026-15307). The string was forwarded to GDALRaster, enabling SSRF.
+- hl_cve_2026_15307.tests.CVE202615307SpatialLookupTest.test_vsis3_string_raises_suspicious_operation: AssertionError: VULNERABLE: get_prep_value accepted a /vsis3/ string without raising SuspiciousOperation (CVE-2026-15307). The string was forwarded to GDALRaster, enabling SSRF.
