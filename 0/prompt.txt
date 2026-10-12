@@ -1,0 +1,244 @@
+Backport a security fix to Django 4.2 (this checkout: tag 4.2.30 + fork base).
+
+Upstream fixed CVE-2026-84429 on the 5.2 branch with the commit below. Rebuild the same fix
+for 4.2 using this codebase's idioms (4.2 lacks some 5.x helpers; do not add them).
+
+Rules:
+- Keep the fix's observable behaviour identical to upstream: the same exception types
+  and the same user-visible messages (copy new or changed message strings verbatim).
+- Edit only files under django/. Do not create, edit or delete anything under tests/.
+- Do not commit or push.
+- The failing probe is tests/hl_cve_2026_84429. Check with:
+    python tests/runtests.py hl_cve_2026_84429 --parallel=1
+  and keep the touched module's tests passing, e.g.:
+    python tests/runtests.py model_formsets --parallel=1
+- Finish with a one-paragraph summary of the change.
+
+## Upstream commit message (intent)
+[5.2.x] Fixed CVE-2026-84429 -- Simplified parse_header_parameters by leveraging stdlib's Message.
+
+The `parse_header_parameters` function historically used Python's `cgi`
+module (now deprecated). In 34e2148fc725e7200050f74130d7523e3cd8507a,
+the logic was inlined to work around this deprecation (#33173). Later,
+in d4d5427571b4bf3a21c902276c2a00215c2a37cc, the header parsing logic
+was further cleaned up to align with multipartparser.py (#33697). It was
+then replaced with Python's email.message.Message API in #35440, and
+reverted in #36520 over a performance concern on common headers.
+
+But recently, a security report showed that `parse_header_parameters()`
+parsed header values in time quadratic in the number of separators
+inside a quoted parameter. Because the per-call length limit does not
+bound the combined size of a repeated header, an unauthenticated request
+could consume excessive CPU, for example via the `Accept` header, which
+is parsed by `HttpRequest.accepted_types`.
+
+Therefore, this change restores the `email.message.Message` approach,
+which parses in linear time, while keeping the fast path for headers
+without parameters and continuing to reject invalid RFC 2231 encodings
+(#36991).
+
+Thanks to Raphael Gaschignard for testing, and to Jake Howard,
+Adam Johnson, and Shai Berger for reviews. Thanks to Jisung Chae and
+Peter Thomassen for the security report.
+
+Co-authored-by: Khudyakov Artem <khudyak.artem@gmail.com>
+Co-authored-by: Ben Cail <bcail@crossway.org>
+
+Backport of 7ff7fcc0508864a4bc39693128ace38b1e95a890 from main.
+
+
+
+## Upstream fix diff (5.2)
+```diff
+diff --git a/django/utils/http.py b/django/utils/http.py
+index 3b25f33621..16d2d7cec6 100644
+--- a/django/utils/http.py
++++ b/django/utils/http.py
+@@ -1,12 +1,14 @@
+ import base64
++import codecs
+ import re
+ import unicodedata
+ from binascii import Error as BinasciiError
+ from datetime import datetime, timezone
+-from email.utils import formatdate
+-from urllib.parse import quote, unquote
++from email.message import Message
++from email.utils import collapse_rfc2231_value, formatdate
++from urllib.parse import quote
+ from urllib.parse import urlencode as original_urlencode
+ from urllib.parse import urlsplit
+ 
+ from django.utils.datastructures import MultiValueDict
+ from django.utils.regex_helper import _lazy_re_compile
+@@ -313,50 +315,43 @@ def escape_leading_slashes(url):
+     if url.startswith("//"):
+         url = "/%2F{}".format(url.removeprefix("//"))
+     return url
+ 
+ 
+-def _parseparam(s):
+-    while s[:1] == ";":
+-        s = s[1:]
+-        end = s.find(";")
+-        while end > 0 and (s.count('"', 0, end) - s.count('\\"', 0, end)) % 2:
+-            end = s.find(";", end + 1)
+-        if end < 0:
+-            end = len(s)
+-        f = s[:end]
+-        yield f.strip()
+-        s = s[end:]
+-
+-
+ def parse_header_parameters(line):
+     """
+     Parse a Content-type like header.
+     Return the main content-type and a dictionary of options.
+     """
+-    parts = _parseparam(";" + line)
+-    key = parts.__next__().lower()
++    if not line:
++        return "", {}
++
++    # Fast path for no params.
++    if ";" not in line:
++        return line.strip().lower(), {}
++
++    m = Message()
++    m["content-type"] = line
++    params = m.get_params()
++
+     pdict = {}
+-    for p in parts:
+-        i = p.find("=")
+-        if i >= 0:
+-            has_encoding = False
+-            name = p[:i].strip().lower()
+-            if name.endswith("*"):
+-                # Lang/encoding embedded in the value (like "filename*=UTF-8''file.ext")
+-                # https://tools.ietf.org/html/rfc2231#section-4
+-                name = name[:-1]
+-                if p.count("'") == 2:
+-                    has_encoding = True
+-            value = p[i + 1 :].strip()
+-            if len(value) >= 2 and value[0] == value[-1] == '"':
+-                value = value[1:-1]
+-                value = value.replace("\\\\", "\\").replace('\\"', '"')
+-            if has_encoding:
+-                encoding, lang, value = value.split("'")
+-                value = unquote(value, encoding=encoding)
+-            pdict[name] = value
++    key = params.pop(0)[0].lower()
++    for name, value in params:
++        if not name:
++            continue
++        if isinstance(value, tuple):
++            # An RFC 2231 encoded value: (charset, language, value). Reject an
++            # unknown charset rather than let collapse_rfc2231_value() fallback
++            # to us-ascii and silently accept it.
++            if encoding := value[0]:
++                try:
++                    codecs.lookup(encoding)
++                except LookupError:
++                    msg = f"Invalid encoding {encoding!r} for RFC 2231 param."
++                    raise ValueError(msg)
++            value = collapse_rfc2231_value(value)
++        pdict[name] = value
+     return key, pdict
+ 
+ 
+ def content_disposition_header(as_attachment, filename):
+     """
+
+```
+
+## History of the touched code on 4.2 (git log -L)
+### _parseparam (django/utils/http.py:409-419)
+commit 34e2148fc7 2022-05-10
+Refs #33173 -- Removed use of deprecated cgi module.
+
+diff --git a/django/utils/http.py b/django/utils/http.py
+--- a/django/utils/http.py
++++ b/django/utils/http.py
+@@ -369,0 +371,11 @@
++def _parseparam(s):
++    while s[:1] == ";":
++        s = s[1:]
++        end = s.find(";")
++        while end > 0 and (s.count('"', 0, end) - s.count('\\"', 0, end)) % 2:
++            end = s.find(";", end + 1)
++        if end < 0:
++            end = len(s)
++        f = s[:end]
++        yield f.strip()
++        s = s[end:]
+
+
+### parse_header_parameters (django/utils/http.py:422-449)
+commit d4d5427571 2022-06-24
+Refs #33697 -- Used django.utils.http.parse_header_parameters() for parsing boundary streams.
+
+diff --git a/django/utils/http.py b/django/utils/http.py
+--- a/django/utils/http.py
++++ b/django/utils/http.py
+@@ -384,18 +385,28 @@
+ def parse_header_parameters(line):
+     """
+     Parse a Content-type like header.
+     Return the main content-type and a dictionary of options.
+     """
+     parts = _parseparam(";" + line)
+-    key = parts.__next__()
++    key = parts.__next__().lower()
+     pdict = {}
+     for p in parts:
+         i = p.find("=")
+         if i >= 0:
++            has_encoding = False
+             name = p[:i].strip().lower()
++            if name.endswith("*"):
++                # Lang/encoding embedded in the value (like "filename*=UTF-8''file.ext")
++                # https://tools.ietf.org/html/rfc2231#section-4
++                name = name[:-1]
++                if p.count("'") == 2:
++                    has_encoding = True
+             value = p[i + 1 :].strip()
+             if len(value) >= 2 and value[0] == value[-1] == '"':
+                 value = value[1:-1]
+                 value = value.replace("\\\\", "\\").replace('\\"', '"')
++            if has_encoding:
++                encoding, lang, value = value.split("'")
++                value = unquote(value, encoding=encoding)
+             pdict[name] = value
+     return key, pdict
+commit 34e2148fc7 2022-05-10
+Refs #33173 -- Removed use of deprecated cgi module.
+
+diff --git a/django/utils/http.py b/django/utils/http.py
+--- a/django/utils/http.py
++++ b/django/utils/http.py
+@@ -369,0 +384,18 @@
++def parse_header_parameters(line):
++    """
++    Parse a Content-type like header.
++    Return the main content-type and a dictionary of options.
++    """
++    parts = _parseparam(";" + line)
++    key = parts.__next__()
++    pdict = {}
++    for p in parts:
++        i = p.find("=")
++        if i >= 0:
++            name = p[:i].strip().lower()
++            value = p[i + 1 :].strip()
++            if len(value) >= 2 and value[0] == value[-1] == '"':
++                value = value[1:-1]
++                value = value.replace("\\\\", "\\").replace('\\"', '"')
++            pdict[name] = value
++    return key, pdict
+
+
+## The probe fails on 4.2 like this
+Outcome on Django 4.2: FAIL (FAILED (failures=2))
+- hl_cve_2026_84429.tests.ParseHeaderParametersBehaviourTests.test_rfc2231_missing_double_quotes_not_decoded_in_vulnerable: AssertionError: Expected "'Hello World" but got "'Hello%20World". Vulnerable code does not decode percent-encoding in malformed RFC 2231 values.
+- hl_cve_2026_84429.tests.ParseHeaderParametersBehaviourTests.test_rfc2231_wrong_title_decoded: AssertionError: Expected decoded title "'This is ***fun***" but got "'This%20is%20%2A%2A%2Afun%2A%2A%2A". This indicates the vulnerable parse_header_parameters is in use.
